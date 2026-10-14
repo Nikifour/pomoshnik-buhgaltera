@@ -1,0 +1,74 @@
+# Сборка и публикация релиза: git tag v1.2.3 && git push origin v1.2.3
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check no company data in repository
+        shell: pwsh
+        run: |
+          # в репозитории допустима только иконка программы; никаких картинок, настроек и документов
+          $bad = git ls-files | Where-Object {
+            ($_ -match '\.(png|jpe?g|bmp|pdf|xlsx?|docx?|pbsettings)$') -or ($_ -match '(^|/)data/') -or ($_ -match 'settings\.json$') -or
+            (($_ -like 'assets/*') -and ($_ -ne 'assets/icon.ico'))
+          }
+          if ($bad) { Write-Error ("Найдены файлы, которых не должно быть в репозитории:`n" + ($bad -join "`n")); exit 1 }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set version from tag
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          (Get-Content version.py -Encoding utf8) -replace '^__version__ = ".*"', "__version__ = `"$v`"" |
+            Set-Content version.py -Encoding utf8
+          Get-Content version.py
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name Pomoshnik-Buhgaltera --icon assets/icon.ico
+          --add-data "assets;assets" --collect-data customtkinter app.py
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # Inno Setup 6 предустановлен на windows-latest; если нет — ставим
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          & $iscc /Q "/DAppVersion=$v" installer/setup.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          Push-Location dist
+          Get-FileHash Pomoshnik-Buhgaltera.exe, Pomoshnik-Buhgaltera-Setup.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Out-File SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+          Pop-Location
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          dist/Pomoshnik-Buhgaltera-Setup.exe dist/Pomoshnik-Buhgaltera.exe dist/SHA256SUMS.txt
+          --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md

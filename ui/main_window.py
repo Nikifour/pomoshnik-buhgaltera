@@ -20,9 +20,11 @@ from ui.widgets import ask_cancel, ask_password, button, error, hbox, info, labe
 from version import __version__
 
 APPEARANCE = {"Светлая": "light", "Тёмная": "dark", "Как в системе": "system"}
-NAV = [("new", "＋   Новое КП"), ("history", "🕘   История"), ("template", "🎨   Шаблон КП"),
-       ("designer", "🧩   Конструктор")]
-PROTECTED = ("template", "designer")  # страницы под паролем шаблона
+# Рабочее меню — то, чем пользуются каждый день. Настройки вынесены отдельно,
+# чтобы шаблон и макет нельзя было случайно поменять в процессе работы.
+NAV_WORK = [("new", "＋   Новое КП"), ("history", "🕘   История")]
+NAV_SETTINGS = [("template", "🎨   Шаблон КП"), ("designer", "🧩   Конструктор")]
+SETTINGS_PAGES = tuple(k for k, _ in NAV_SETTINGS)
 
 
 class MainWindow(QMainWindow):
@@ -106,7 +108,8 @@ class MainWindow(QMainWindow):
         self.nav = QButtonGroup(self)
         self.nav.setExclusive(True)
         self.nav_buttons: dict[str, QPushButton] = {}
-        for key, text in NAV:
+
+        def nav_button(key, text):
             b = QPushButton(text)
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -114,32 +117,96 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda checked=False, k=key: self.show_page(k))
             self.nav.addButton(b)
             self.nav_buttons[key] = b
-            lay.addWidget(b)
-        lay.addStretch(1)
+            return b
 
-        lay.addWidget(label("Оформление", muted=True, small=True))
+        # --- рабочий режим: только основные кнопки
+        self.work_box = QWidget()
+        wl = QVBoxLayout(self.work_box)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(4)
+        for key, text in NAV_WORK:
+            wl.addWidget(nav_button(key, text))
+        lay.addWidget(self.work_box)
+
+        # --- режим настроек
+        self.settings_box = QWidget()
+        sl = QVBoxLayout(self.settings_box)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(4)
+        back = QPushButton("←   Вернуться к работе")
+        back.setObjectName("nav")
+        back.setCursor(Qt.PointingHandCursor)
+        back.clicked.connect(lambda: self.exit_settings())
+        sl.addWidget(back)
+        sl.addSpacing(14)
+        sl.addWidget(label("НАСТРОЙКИ", muted=True, small=True))
+        for key, text in NAV_SETTINGS:
+            sl.addWidget(nav_button(key, text))
+        sl.addSpacing(18)
+        sl.addWidget(label("Оформление программы", muted=True, small=True))
         self.appearance = QComboBox()
         self.appearance.addItems(list(APPEARANCE))
         current = self.settings.get_state("appearance", "light")
         self.appearance.setCurrentText(next(k for k, v in APPEARANCE.items() if v == current))
         self.appearance.currentTextChanged.connect(self._set_appearance)
-        lay.addWidget(self.appearance)
-        lay.addSpacing(10)
+        sl.addWidget(self.appearance)
+        sl.addSpacing(10)
         upd = QPushButton("Проверить обновления")
         upd.setObjectName("sideButton")
         upd.setCursor(Qt.PointingHandCursor)
         upd.clicked.connect(lambda: self.check_updates(silent=False))
-        lay.addWidget(upd)
+        sl.addWidget(upd)
+        self.settings_box.hide()
+        lay.addWidget(self.settings_box)
+        lay.addStretch(1)
+
+        # --- внизу: вход в настройки (неброско) и версия
+        self.btn_settings = QPushButton("⚙   Настройки")
+        self.btn_settings.setObjectName("sideButton")
+        self.btn_settings.setCursor(Qt.PointingHandCursor)
+        self.btn_settings.setToolTip("Шаблон КП, конструктор, оформление, обновления")
+        self.btn_settings.clicked.connect(lambda: self.enter_settings())
+        lay.addWidget(self.btn_settings)
         lay.addSpacing(6)
         lay.addWidget(label(f"Версия {__version__}", muted=True, small=True))
         return sb
 
+    # ------------------------------------------------------------ режимы: работа / настройки
+    def in_settings(self) -> bool:
+        return self.settings_box.isVisible() or self.current in SETTINGS_PAGES
+
+    def enter_settings(self, page: str = "template") -> bool:
+        if not self._unlock_template():
+            return False
+        self.work_box.hide()
+        self.btn_settings.hide()
+        self.settings_box.show()
+        self._switch(page)
+        return True
+
+    def exit_settings(self):
+        if not self._leave_designer():
+            return
+        self.unlocked = False  # пароль спросим снова при следующем входе в настройки
+        self.settings_box.hide()
+        self.work_box.show()
+        self.btn_settings.show()
+        self._switch("new")
+
     def show_page(self, key: str):
+        """Открыть страницу; страницы настроек открываются только через режим настроек."""
         if key == self.current:
             return
-        if not self._leave_designer() or (key in PROTECTED and not self._unlock_template()):
+        if key in SETTINGS_PAGES and not self.settings_box.isVisible():
+            if not self.enter_settings(key):
+                self.nav_buttons[self.current or "new"].setChecked(True)
+            return
+        if not self._leave_designer():
             self.nav_buttons[self.current or "new"].setChecked(True)
             return
+        self._switch(key)
+
+    def _switch(self, key: str):
         self.stack.setCurrentWidget(self.pages[key])
         self.nav_buttons[key].setChecked(True)
         self.current = key

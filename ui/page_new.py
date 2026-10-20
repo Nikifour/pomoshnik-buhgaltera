@@ -98,8 +98,16 @@ class NewKPPage(QWidget):
         self.ed_date.setDate(QDate.currentDate())
         self.ed_date.setFixedWidth(140)
         self.tg_pdf = Toggle("Сохранить также в PDF")
+        # «из счёта»: покупатель и его реквизиты из выбранного счёта. После загрузки счёта поля
+        # заполняются по настройкам шаблона, а переключателем это можно поменять для конкретного КП.
+        self.tg_buyer = Toggle("из счёта")
+        self.tg_buyer.setToolTip("Включено — «Кому» и реквизиты берутся из выбранного счёта.\n"
+                                 "Выключено — оба поля пустые (можно вписать вручную).\n"
+                                 "Положение по умолчанию задаётся в «Шаблон КП» → «Из счёта».")
+        self.tg_buyer.setEnabled(False)
+        self.tg_buyer.toggled.connect(self._buyer_toggled)
         grid.addWidget(label("Кому", muted=True), 0, 0)
-        grid.addWidget(self.ed_buyer, 0, 1)
+        grid.addLayout(hbox(self.ed_buyer, 12, self.tg_buyer), 0, 1)
         grid.addWidget(label("Реквизиты", muted=True), 1, 0)
         grid.addWidget(self.ed_details, 1, 1)
         grid.addWidget(label("№ КП", muted=True), 2, 0)
@@ -169,6 +177,8 @@ class NewKPPage(QWidget):
         s = self.s
         self.ed_buyer.setText(inv.buyer if s["fill_buyer"] else "")
         self.ed_details.setText(inv.buyer_details if s["fill_buyer_details"] else "")
+        self.tg_buyer.setEnabled(bool(inv.buyer or inv.buyer_details))
+        self.tg_buyer.set_value(bool(self.ed_buyer.text() or self.ed_details.text()))
         # № КП = № счёта; если выключено или в счёте номера нет — свой счётчик
         self.ed_number.setText(inv.number if s["fill_number"] and inv.number else str(s.next_number()))
         d = inv.date if s["fill_date"] and inv.date else date.today()
@@ -189,6 +199,12 @@ class NewKPPage(QWidget):
         vat = f"  ·  в т.ч. НДС {money(inv.vat)}" if inv.vat is not None else ""
         self.lbl_vat.setText(f"Позиций: {len(inv.items)}{vat}")
         self.btn_make.setEnabled(True)
+
+    def _buyer_toggled(self, on: bool):
+        """Покупатель и его реквизиты — вместе: нет смысла брать одно без другого."""
+        if self.invoice:
+            self.ed_buyer.setText(self.invoice.buyer if on else "")
+            self.ed_details.setText(self.invoice.buyer_details if on else "")
 
     def make_kp(self):
         if not self.invoice:

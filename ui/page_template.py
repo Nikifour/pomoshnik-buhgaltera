@@ -4,17 +4,21 @@ from __future__ import annotations
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from tkinter import colorchooser, filedialog, messagebox
 
-import customtkinter as ctk
-from PIL import Image
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtWidgets import (QColorDialog, QComboBox, QFileDialog, QFormLayout, QGridLayout, QLabel,
+                               QLineEdit, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QTabWidget,
+                               QVBoxLayout, QWidget)
 
 from core.colors import PRESETS, logo_palette, readable_accent
-from core.kp_builder import build_kp, demo_invoice
-from core.settings_store import APP_NAME, DEFAULTS, IMAGE_KINDS, Settings, hash_password
-from ui import theme as T
+from core import richtext
+from core.kp_builder import auto_signature, build_kp, demo_invoice, signature_lines
+from core.settings_store import DEFAULTS, IMAGE_KINDS, Settings, hash_password
+from ui.rich_edit import RichTextEdit
 from ui.transfer_actions import export_settings, import_settings
-from ui.widgets import Card, PasswordDialog, SwatchRow, open_path, page_header, primary_button, secondary_button
+from ui.widgets import (Card, SwatchRow, Toggle, ask, ask_password, button, error, hbox, info, label,
+                        open_path, page_header, scroll_area)
 
 FIELDS = [
     ("company_name", "Краткое название"),
@@ -29,229 +33,244 @@ FIELDS = [
 ]
 TEXTS = [
     ("greeting", "Текст приветствия",
-     "Можно использовать {КОМПАНИЯ}, {ПОКУПАТЕЛЬ}, {МЕНЕДЖЕР} — подставятся автоматически", 90),
-    ("conditions", "Условия предложения", "Каждая строка — отдельный пункт списка", 120),
+     "Выделите текст и задайте оформление кнопками сверху. {КОМПАНИЯ}, {ПОКУПАТЕЛЬ}, {МЕНЕДЖЕР} "
+     "подставятся автоматически", 100),
+    ("conditions", "Условия предложения", "Каждая строка — отдельный пункт списка", 140),
+    ("signature_text", "Подпись внизу КП",
+     "Выделите текст и задайте оформление кнопками сверху. Кнопка «WhatsApp» ставит значок после номера. "
+     "Можно {КОМПАНИЯ}, {МЕНЕДЖЕР}", 130),
+    ("from_details", "Строка «От» — под названием компании",
+     "Мелким шрифтом под «От: компания», например БИН и адрес. Пусто — строки нет", 60),
     ("footer", "Подвал страницы", "Мелкий текст внизу каждой страницы (реквизиты, ссылки)", 60),
 ]
+RICH = ("greeting", "signature_text")  # поля с кнопками оформления
+
+
+def _plain_greeting(text: str) -> list:
+    return richtext.from_plain(text, lambda i: dict(s=10))
+
+
 INVOICE_FIELDS = [
     ("fill_number", "Номер КП = номер счёта", "Выключено — программа нумерует КП сама по порядку"),
     ("fill_date", "Дата КП = дата счёта", "Выключено — ставится сегодняшняя дата"),
     ("fill_buyer", "Покупатель («Кому»)", "Название покупателя из счёта"),
     ("fill_buyer_details", "Реквизиты покупателя", "БИН / ИИН и адрес из счёта"),
     ("show_vat", "Строки «Итого» и «В т.ч. НДС»", "Выключено — в КП только итоговая сумма предложения"),
-    ("show_amount_words", "Сумма прописью", "«Всего наименований …, на сумму …» и сумма прописью"),
 ]
 IMAGES = [("logo", "Логотип компании"), ("logo2", "Второй логотип (бренд)"), ("stamp", "Печать и подпись")]
 
 
-class TemplatePage(ctk.CTkFrame):
-    def __init__(self, master, settings: Settings, on_saved=None):
-        super().__init__(master, fg_color="transparent")
+def _tab(*widgets) -> QWidget:
+    inner = QWidget()
+    lay = QVBoxLayout(inner)
+    lay.setContentsMargins(16, 12, 16, 16)
+    lay.setSpacing(12)
+    for w in widgets:
+        lay.addWidget(w)
+    lay.addStretch(1)
+    return scroll_area(inner)
+
+
+class TemplatePage(QWidget):
+    def __init__(self, settings: Settings, on_saved=None):
+        super().__init__()
+        self.setObjectName("page")
         self.s = settings
         self.on_saved = on_saved
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.lines: dict[str, QLineEdit] = {}
+        self.texts: dict[str, QPlainTextEdit] = {}
+        self.rich: dict[str, RichTextEdit] = {}
+        self.toggles: dict[str, Toggle] = {}
+        self.thumbs: dict[str, QLabel] = {}
+        self.accent = self.s["accent_color"]
+        self.new_images: dict[str, str | None] = {}
+        self._new_pw_hash = ""
 
-        page_header(self, "Шаблон КП", "Контакты, тексты, логотипы и печать").grid(
-            row=0, column=0, sticky="ew", pady=(0, 12))
-        ctk.CTkLabel(self, text="⚠  Изменения применяются ко всем будущим КП. Перед сохранением создаётся резервная копия.",
-                     fg_color=T.WARN_BG, text_color=T.WARN_TEXT, corner_radius=8, font=T.font(12),
-                     anchor="w", height=34).grid(row=1, column=0, sticky="ew", pady=(0, 12), ipadx=12)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+        root.addWidget(page_header("Шаблон КП", "Контакты, тексты, логотипы и печать"))
+        root.addWidget(label("⚠  Изменения применяются ко всем будущим КП. Перед сохранением создаётся "
+                             "резервная копия.", name="warn"))
 
-        self.tabs = ctk.CTkTabview(self, fg_color=T.CARD, segmented_button_selected_color=T.BRAND,
-                                   segmented_button_selected_hover_color=T.BRAND_HOVER,
-                                   border_width=1, border_color=T.BORDER, corner_radius=12)
-        self.tabs.grid(row=2, column=0, sticky="nsew")
-        for name in ("Компания", "Тексты", "Из счёта", "Оформление", "Прочее"):
-            self.tabs.add(name)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._tab_company(), "Компания")
+        self.tabs.addTab(self._tab_texts(), "Тексты")
+        self.tabs.addTab(self._tab_invoice(), "Из счёта")
+        self.tabs.addTab(self._tab_design(), "Оформление")
+        self.tabs.addTab(self._tab_other(), "Прочее")
+        root.addWidget(self.tabs, 1)
 
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        secondary_button(bar, "👁  Предпросмотр", self.preview, width=150).pack(side="left")
-        primary_button(bar, "Сохранить шаблон", self.save, width=180).pack(side="right")
-        secondary_button(bar, "Отменить изменения", self.load_values, width=170).pack(side="right", padx=8)
-
-        self.vars: dict[str, ctk.Variable] = {}
-        self.texts: dict[str, ctk.CTkTextbox] = {}
-        self.thumbs: dict[str, ctk.CTkLabel] = {}
-        self._build_company(self.tabs.tab("Компания"))
-        self._build_texts(self.tabs.tab("Тексты"))
-        self._build_design(self.tabs.tab("Оформление"))
-        self._build_invoice(self.tabs.tab("Из счёта"))
-        self._build_other(self.tabs.tab("Прочее"))
+        root.addLayout(hbox(button("👁  Предпросмотр", self.preview), "stretch",
+                            button("Отменить изменения", self.load_values),
+                            button("Сохранить шаблон", self.save, primary=True, width=180)))
         self.load_values()
 
     # ------------------------------------------------------------ вкладки
-    def _build_company(self, tab):
-        f = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        f.pack(fill="both", expand=True)
-        f.columnconfigure(1, weight=1)
-        for i, (key, label) in enumerate(FIELDS):
-            ctk.CTkLabel(f, text=label, font=T.font(13), text_color=T.MUTED, anchor="w").grid(
-                row=i, column=0, sticky="w", padx=(8, 16), pady=5)
-            self.vars[key] = ctk.StringVar()
-            ctk.CTkEntry(f, textvariable=self.vars[key], height=34, font=T.font(13)).grid(
-                row=i, column=1, sticky="ew", padx=(0, 8), pady=5)
+    def _tab_company(self):
+        card = Card()
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        for key, title in FIELDS:
+            self.lines[key] = QLineEdit()
+            if key in ("phone", "manager_phone"):
+                self.lines[key].setPlaceholderText("например: +7 777 123 45 67 {WhatsApp} — с {WhatsApp} в КП будет значок")
+            form.addRow(label(title, muted=True), self.lines[key])
+        card.body.addLayout(form)
+        return _tab(card)
 
-    def _build_texts(self, tab):
-        f = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        f.pack(fill="both", expand=True)
-        f.columnconfigure(0, weight=1)
-        r = 0
-        for key, label, hint, h in TEXTS:
-            ctk.CTkLabel(f, text=label, font=T.font(13, "bold"), text_color=T.TEXT, anchor="w").grid(
-                row=r, column=0, sticky="w", padx=8)
-            ctk.CTkLabel(f, text=hint, font=T.font(11), text_color=T.MUTED, anchor="w").grid(
-                row=r + 1, column=0, sticky="w", padx=8)
-            t = ctk.CTkTextbox(f, height=h, font=T.font(13), border_width=1, border_color=T.BORDER, wrap="word")
-            t.grid(row=r + 2, column=0, sticky="ew", padx=8, pady=(4, 14))
-            self.texts[key] = t
-            r += 3
+    def _tab_texts(self):
+        card = Card()
+        for key, title, hint, h in TEXTS:
+            card.body.addWidget(label(title, name="h2"))
+            card.body.addWidget(label(hint, muted=True, small=True))
+            if key in RICH:
+                t = RichTextEdit(h)  # с кнопками оформления: жирный, курсив, цвет, размер
+                self.rich[key] = t
+            else:
+                t = QPlainTextEdit()
+                t.setFixedHeight(h)
+                self.texts[key] = t
+            card.body.addWidget(t)
+            card.body.addSpacing(8)
+        return _tab(card)
 
-    def _build_design(self, tab):
-        f = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        f.pack(fill="both", expand=True)
-        f.columnconfigure((0, 1), weight=1)
+    def _tab_invoice(self):
+        card = Card("Что переносить из счёта на оплату в КП",
+                    "Выключенные поля в окне «Новое КП» остаются пустыми — их можно заполнить вручную. "
+                    "Позиции и суммы переносятся всегда.")
+        for key, title, hint in INVOICE_FIELDS:
+            texts = QVBoxLayout()
+            texts.setSpacing(0)
+            texts.addWidget(label(title))
+            texts.addWidget(label(hint, muted=True, small=True))
+            self.toggles[key] = Toggle()
+            row = hbox("stretch", self.toggles[key], margins=(4, 6, 4, 6))
+            row.insertLayout(0, texts, 1)
+            card.body.addLayout(row)
+        return _tab(card)
+
+    def _tab_design(self):
+        scheme = Card("Цветовая схема", "Применяется к интерфейсу программы и к коммерческим предложениям")
+        self.swatches = SwatchRow(list(PRESETS.values()))
+        self.swatches.picked.connect(self.set_color)
+        self.current_swatch = QPushButton()
+        self.current_swatch.setFixedSize(40, 30)
+        self.current_swatch.setCursor(Qt.PointingHandCursor)
+        self.current_swatch.clicked.connect(self.pick_color)
+        scheme.body.addWidget(self.swatches)
+        scheme.body.addLayout(hbox(label("Текущий цвет"), self.current_swatch, button("Свой цвет…", self.pick_color),
+                                   button("Подобрать по логотипу", self.color_from_logo), "stretch"))
+
+        grid_w = QWidget()
+        grid = QGridLayout(grid_w)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(12)
         for i, (kind, title) in enumerate(IMAGES):
-            box = Card(f, title)
-            box.grid(row=i // 2 + 1, column=i % 2, sticky="nsew", padx=6, pady=6)
-            lbl = ctk.CTkLabel(box, text="", height=90)
-            lbl.grid(row=box.body_row, column=0, pady=8)
-            self.thumbs[kind] = lbl
-            row = ctk.CTkFrame(box, fg_color="transparent")
-            row.grid(row=box.body_row + 1, column=0, pady=(0, 14))
-            secondary_button(row, "Загрузить…", lambda k=kind: self.pick_image(k), width=110, height=32).pack(side="left")
-            secondary_button(row, "Убрать", lambda k=kind: self.remove_image(k), width=80, height=32).pack(side="left", padx=6)
+            card = Card(title)
+            thumb = QLabel()
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setMinimumHeight(96)
+            self.thumbs[kind] = thumb
+            card.body.addWidget(thumb)
+            card.body.addLayout(hbox("stretch", button("Загрузить…", lambda k=kind: self.pick_image(k)),
+                                     button("Убрать", lambda k=kind: self.remove_image(k)), "stretch"))
+            grid.addWidget(card, i // 2, i % 2)
+        opts = QWidget()
+        ol = QVBoxLayout(opts)
+        ol.setContentsMargins(8, 8, 8, 8)
+        self.toggles["show_stamp"] = Toggle("Ставить печать и подпись в КП")
+        ol.addWidget(self.toggles["show_stamp"])
+        ol.addWidget(label("Логотипы и печать — PNG с прозрачным фоном, от 400 px в ширину.", muted=True,
+                           small=True, wrap=True))
+        ol.addStretch(1)
+        grid.addWidget(opts, 1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        return _tab(scheme, grid_w)
 
-        opts = ctk.CTkFrame(f, fg_color="transparent")
-        opts.grid(row=2, column=1, sticky="nw", padx=12, pady=12)
-        self.vars["show_stamp"] = ctk.BooleanVar()
-        ctk.CTkSwitch(opts, text="Ставить печать и подпись в КП", variable=self.vars["show_stamp"],
-                      font=T.font(13), progress_color=T.BRAND).pack(anchor="w", pady=(0, 16))
-        ctk.CTkLabel(opts, text="Логотипы и печать — PNG с прозрачным фоном,\nот 400 px в ширину.",
-                     font=T.font(11), text_color=T.MUTED, justify="left").pack(anchor="w")
+    def _tab_other(self):
+        main = Card()
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+        self.spin_validity = QSpinBox()
+        self.spin_validity.setRange(0, 365)
+        self.spin_validity.setFixedWidth(90)
+        form.addRow(label("Срок действия КП, дней", muted=True),
+                    hbox(self.spin_validity, label("0 — не указывать срок", muted=True, small=True), "stretch"))
+        self.ed_output = QLineEdit()
+        form.addRow(label("Папка для готовых КП", muted=True), hbox(self.ed_output, button("…", self.pick_dir)))
+        self.toggles["also_pdf"] = Toggle("По умолчанию сохранять также в PDF")
+        form.addRow("", self.toggles["also_pdf"])
+        main.body.addLayout(form)
 
-        scheme = Card(f, "Цветовая схема", "Применяется к интерфейсу программы и к коммерческим предложениям")
-        scheme.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
-        self.vars["accent_color"] = ctk.StringVar()
-        self.scheme_swatches = SwatchRow(scheme, list(PRESETS.values()), self.set_color)
-        self.scheme_swatches.grid(row=scheme.body_row, column=0, sticky="w", padx=20, pady=(10, 6))
-        crow = ctk.CTkFrame(scheme, fg_color="transparent")
-        crow.grid(row=scheme.body_row + 1, column=0, sticky="w", padx=20, pady=(4, 16))
-        ctk.CTkLabel(crow, text="Текущий цвет", font=T.font(13), text_color=T.TEXT).pack(side="left")
-        self.swatch = ctk.CTkButton(crow, text="", width=36, height=28, corner_radius=6, command=self.pick_color)
-        self.swatch.pack(side="left", padx=10)
-        secondary_button(crow, "Свой цвет…", self.pick_color, width=110, height=30).pack(side="left")
-        secondary_button(crow, "Подобрать по логотипу", self.color_from_logo, width=180, height=30).pack(
-            side="left", padx=8)
+        transfer = Card("Перенос настроек", "Один файл с контактами, текстами, логотипами и цветами — "
+                                            "чтобы настроить программу у сотрудника за минуту")
+        transfer.body.addLayout(hbox(button("⬆  Экспорт настроек…", lambda: export_settings(self, self.s), primary=True),
+                                     button("⬇  Импорт настроек…", self.import_profile), "stretch"))
 
-    def _build_invoice(self, tab):
-        f = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        f.pack(fill="both", expand=True)
-        f.columnconfigure(0, weight=1)
-        ctk.CTkLabel(f, text="Что переносить из счёта на оплату в КП", font=T.font(14, "bold"),
-                     text_color=T.TEXT, anchor="w").grid(row=0, column=0, sticky="w", padx=8, pady=(4, 0))
-        ctk.CTkLabel(f, text="Выключенные поля в окне «Новое КП» остаются пустыми — их можно заполнить вручную. "
-                             "Позиции и суммы переносятся всегда.",
-                     font=T.font(11), text_color=T.MUTED, anchor="w", wraplength=760, justify="left").grid(
-            row=1, column=0, sticky="w", padx=8, pady=(0, 10))
-        for i, (key, title, hint) in enumerate(INVOICE_FIELDS):
-            row = ctk.CTkFrame(f, fg_color=T.BG if i % 2 == 0 else "transparent", corner_radius=8)
-            row.grid(row=i + 2, column=0, sticky="ew", padx=4, pady=1)
-            row.columnconfigure(0, weight=1)
-            ctk.CTkLabel(row, text=title, font=T.font(13), text_color=T.TEXT, anchor="w").grid(
-                row=0, column=0, sticky="w", padx=14, pady=(8, 0))
-            ctk.CTkLabel(row, text=hint, font=T.font(11), text_color=T.MUTED, anchor="w").grid(
-                row=1, column=0, sticky="w", padx=14, pady=(0, 8))
-            self.vars[key] = ctk.BooleanVar()
-            ctk.CTkSwitch(row, text="", variable=self.vars[key], progress_color=T.BRAND, width=50).grid(
-                row=0, column=1, rowspan=2, padx=14)
+        sec = Card("Защита")
+        self.pw_label = label("")
+        sec.body.addLayout(hbox(self.pw_label, "stretch", button("Задать пароль…", self.set_password),
+                                button("Снять пароль", self.clear_password)))
 
-    def _build_other(self, tab):
-        f = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        f.pack(fill="both", expand=True)
-        f.columnconfigure(1, weight=1)
+        bk = Card("Резервные копии", "Создаются автоматически при каждом сохранении (последние 10)")
+        self.backup_combo = QComboBox()
+        self.backup_combo.setMinimumWidth(240)
+        bk.body.addLayout(hbox(self.backup_combo, button("Восстановить", self.restore_backup), "stretch",
+                               button("Сбросить к исходным", self.reset_defaults)))
 
-        ctk.CTkLabel(f, text="Срок действия КП, дней", font=T.font(13), text_color=T.MUTED).grid(
-            row=0, column=0, sticky="w", padx=8, pady=6)
-        self.vars["validity_days"] = ctk.StringVar()
-        vrow = ctk.CTkFrame(f, fg_color="transparent")
-        vrow.grid(row=0, column=1, sticky="w")
-        ctk.CTkEntry(vrow, textvariable=self.vars["validity_days"], width=70, height=34).pack(side="left")
-        ctk.CTkLabel(vrow, text="0 — не указывать срок", font=T.font(11), text_color=T.MUTED).pack(side="left", padx=10)
-
-        ctk.CTkLabel(f, text="Папка для готовых КП", font=T.font(13), text_color=T.MUTED).grid(
-            row=1, column=0, sticky="w", padx=8, pady=6)
-        self.vars["output_dir"] = ctk.StringVar()
-        drow = ctk.CTkFrame(f, fg_color="transparent")
-        drow.grid(row=1, column=1, sticky="ew", padx=(0, 8))
-        drow.columnconfigure(0, weight=1)
-        ctk.CTkEntry(drow, textvariable=self.vars["output_dir"], height=34).grid(row=0, column=0, sticky="ew")
-        secondary_button(drow, "…", self.pick_dir, width=40, height=34).grid(row=0, column=1, padx=(6, 0))
-
-        self.vars["also_pdf"] = ctk.BooleanVar()
-        ctk.CTkSwitch(f, text="По умолчанию сохранять также в PDF", variable=self.vars["also_pdf"],
-                      font=T.font(13), progress_color=T.BRAND).grid(row=2, column=1, sticky="w", pady=8)
-
-        sec = Card(f, "Защита")
-        sec.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        srow = ctk.CTkFrame(sec, fg_color="transparent")
-        srow.grid(row=sec.body_row, column=0, sticky="ew", padx=20, pady=(6, 16))
-        self.pw_label = ctk.CTkLabel(srow, text="", font=T.font(13), text_color=T.TEXT)
-        self.pw_label.pack(side="left")
-        secondary_button(srow, "Снять пароль", self.clear_password, width=130, height=32).pack(side="right")
-        secondary_button(srow, "Задать пароль…", self.set_password, width=140, height=32).pack(side="right", padx=8)
-
-        bk = Card(f, "Резервные копии", "Создаются автоматически при каждом сохранении (последние 10)")
-        bk.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        brow = ctk.CTkFrame(bk, fg_color="transparent")
-        brow.grid(row=bk.body_row, column=0, sticky="ew", padx=20, pady=(8, 16))
-        self.backup_menu = ctk.CTkOptionMenu(brow, values=["—"], width=240, fg_color=T.BRAND,
-                                             button_color=T.BRAND_HOVER, button_hover_color=T.BRAND_HOVER)
-        self.backup_menu.pack(side="left")
-        secondary_button(brow, "Восстановить", self.restore_backup, width=120, height=32).pack(side="left", padx=8)
-        secondary_button(brow, "Сбросить к исходным", self.reset_defaults, width=170, height=32).pack(side="right")
-
-        tr = Card(f, "Перенос настроек", "Один файл с контактами, текстами, логотипами и цветами — "
-                                         "чтобы настроить программу у сотрудника за минуту")
-        tr.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        trow = ctk.CTkFrame(tr, fg_color="transparent")
-        trow.grid(row=tr.body_row, column=0, sticky="ew", padx=20, pady=(8, 16))
-        primary_button(trow, "⬆  Экспорт настроек…", lambda: export_settings(self, self.s),
-                       width=200, height=34).pack(side="left")
-        secondary_button(trow, "⬇  Импорт настроек…", self.import_profile, width=200, height=34).pack(
-            side="left", padx=8)
-
-        self.lbl_dir = ctk.CTkLabel(f, text="", font=T.font(11), text_color=T.MUTED, anchor="w")
-        self.lbl_dir.grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=8)
+        self.lbl_dir = label("", muted=True, small=True, wrap=True)
+        self.lbl_dir.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # длинный путь без пробелов не должен растягивать страницу вправо
+        self.lbl_dir.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        return _tab(main, transfer, sec, bk, self.lbl_dir)
 
     # ------------------------------------------------------------ данные
     def load_values(self):
-        """Заполнить форму текущими сохранёнными настройками (сбрасывает несохранённое)."""
-        for k, v in self.vars.items():
-            v.set(self.s[k])
+        """Заполнить форму сохранёнными настройками (сбрасывает несохранённое)."""
+        s = self.s
+        for k, w in self.lines.items():
+            w.setText(str(s[k]))
         for k, t in self.texts.items():
-            t.delete("1.0", "end")
-            t.insert("1.0", self.s[k])
-        self.new_images: dict[str, str | None] = {k: None for k in IMAGE_KINDS}
+            t.setPlainText(s[k])
+        # подпись показываем такой, какой она сейчас печатается (даже если её ещё не настраивали)
+        self.rich["signature_text"].set_lines(signature_lines(s.values))
+        self.rich["greeting"].set_lines(s["greeting_rich"] if not richtext.is_empty(s["greeting_rich"])
+                                        else _plain_greeting(s["greeting"]))
+        for k, tg in self.toggles.items():
+            tg.set_value(bool(s[k]))
+        self.spin_validity.setValue(int(s["validity_days"]))
+        self.ed_output.setText(s["output_dir"])
+        self.new_images = {k: None for k in IMAGE_KINDS}
         for kind in IMAGE_KINDS:
-            self._show_thumb(kind, self.s.image_path(kind))
-        self._new_pw_hash = self.s["editor_password_hash"]
+            self._show_thumb(kind, s.image_path(kind))
+        self._new_pw_hash = s["editor_password_hash"]
         self._update_pw_label()
-        self.scheme_swatches.set_colors(list(PRESETS.values()))
-        self.set_color(self.s["accent_color"])
+        self.swatches.set_colors(list(PRESETS.values()))
+        self.set_color(s["accent_color"])
         self._fill_backups()
-        self.lbl_dir.configure(text=f"Настройки хранятся в: {self.s.dir}")
+        self.lbl_dir.setText(f"Настройки хранятся в: {s.dir}")
 
     def collect(self) -> dict:
-        vals = {k: v.get() for k, v in self.vars.items()}
-        try:
-            vals["validity_days"] = max(0, int(str(vals["validity_days"]).strip() or 0))
-        except ValueError:
-            vals["validity_days"] = DEFAULTS["validity_days"]
-        vals["company_name"] = vals["company_name"].strip()
-        for k, t in self.texts.items():
-            vals[k] = t.get("1.0", "end-1c").strip()
+        vals = {k: w.text().strip() for k, w in self.lines.items()}
+        vals.update({k: t.toPlainText().strip() for k, t in self.texts.items()})
+        # оформленные поля: если оформление не меняли — храним простой текст (КП выглядит как раньше)
+        sig = self.rich["signature_text"].lines()
+        vals["signature_text"] = richtext.plain(sig).strip()
+        legacy_sig = richtext.from_plain(vals["signature_text"] or auto_signature(self.s.values),
+                                         lambda i: dict(b=True, s=11) if i == 1 else dict(c="muted", s=10))
+        vals["signature_rich"] = [] if sig == legacy_sig else sig
+        gr = self.rich["greeting"].lines()
+        vals["greeting"] = richtext.plain(gr).strip()
+        vals["greeting_rich"] = [] if gr == _plain_greeting(vals["greeting"]) else gr
+        vals.update({k: tg.isChecked() for k, tg in self.toggles.items()})
+        vals["validity_days"] = self.spin_validity.value()
+        vals["output_dir"] = self.ed_output.text().strip() or DEFAULTS["output_dir"]
+        vals["accent_color"] = self.accent
         vals["editor_password_hash"] = self._new_pw_hash
         return vals
 
@@ -264,24 +283,22 @@ class TemplatePage(ctk.CTkFrame):
     def _show_thumb(self, kind, path):
         lbl = self.thumbs[kind]
         if not path:
-            lbl.configure(image=None, text="нет картинки", text_color=T.MUTED)
-            lbl._kp_img = None
+            lbl.setPixmap(QPixmap())
+            lbl.setText("нет картинки")
+            lbl.setProperty("muted", True)
             return
-        im = Image.open(path)
-        im.thumbnail((240, 90))
-        img = ctk.CTkImage(light_image=im, dark_image=im, size=im.size)
-        lbl.configure(image=img, text="")
-        lbl._kp_img = img  # держим ссылку, иначе картинку соберёт сборщик мусора
+        pm = QPixmap(str(path))
+        lbl.setText("")
+        lbl.setPixmap(pm.scaled(260, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     # ------------------------------------------------------------ действия
     def pick_image(self, kind):
-        p = filedialog.askopenfilename(filetypes=[("Изображения", "*.png *.jpg *.jpeg *.bmp")])
+        p, _ = QFileDialog.getOpenFileName(self, "Выберите изображение", "",
+                                           "Изображения (*.png *.jpg *.jpeg *.bmp)")
         if not p:
             return
-        try:
-            Image.open(p).verify()
-        except Exception:  # noqa: BLE001
-            messagebox.showerror(APP_NAME, "Файл не является изображением.")
+        if QPixmap(p).isNull():
+            error(self, "Файл не является изображением.")
             return
         self.new_images[kind] = p
         self._show_thumb(kind, p)
@@ -291,44 +308,45 @@ class TemplatePage(ctk.CTkFrame):
         self._show_thumb(kind, None)
 
     def set_color(self, c: str):
-        self.vars["accent_color"].set(c)
-        self.swatch.configure(fg_color=c, hover_color=c)
-        self.scheme_swatches.select(c)
+        self.accent = c
+        self.current_swatch.setStyleSheet(f"background: {c}; border: none; border-radius: 6px;")
+        self.swatches.select(c)
 
     def pick_color(self):
-        c = colorchooser.askcolor(self.vars["accent_color"].get())[1]
-        if c:
-            self.set_color(readable_accent(c.upper()))
+        c = QColorDialog.getColor(QColor(self.accent), self, "Цвет схемы")
+        if c.isValid():
+            self.set_color(readable_accent(c.name().upper()))
 
     def color_from_logo(self):
         logo = self._image_for("logo")
         if not logo:
-            messagebox.showinfo(APP_NAME, "Сначала загрузите логотип компании.")
+            info(self, "Сначала загрузите логотип компании.")
             return
         palette = [readable_accent(c) for c in logo_palette(logo)]
         if not palette:
-            messagebox.showinfo(APP_NAME, "Не удалось определить цвета логотипа.")
+            info(self, "Не удалось определить цвета логотипа.")
             return
         # к готовым схемам добавляем цвета логотипа
-        self.scheme_swatches.set_colors(palette + [c for c in PRESETS.values() if c not in palette][:8 - len(palette)])
+        extra = [c for c in PRESETS.values() if c not in palette][:8 - len(palette)]
+        self.swatches.set_colors(palette + extra)
         self.set_color(palette[0])
 
     def pick_dir(self):
-        d = filedialog.askdirectory(initialdir=self.vars["output_dir"].get())
+        d = QFileDialog.getExistingDirectory(self, "Папка для готовых КП", self.ed_output.text())
         if d:
-            self.vars["output_dir"].set(d)
+            self.ed_output.setText(d)
 
     def _update_pw_label(self):
-        self.pw_label.configure(text="🔒  Пароль на шаблон установлен" if self._new_pw_hash
-                                else "🔓  Пароль не задан — шаблон может менять любой")
+        self.pw_label.setText("🔒  Пароль на шаблон установлен" if self._new_pw_hash
+                              else "🔓  Пароль не задан — шаблон может менять любой")
 
     def set_password(self):
-        a = PasswordDialog.ask(self, "Новый пароль:")
+        a = ask_password(self, "Новый пароль:")
         if not a:
             return
-        b = PasswordDialog.ask(self, "Повторите пароль:")
+        b = ask_password(self, "Повторите пароль:")
         if a != b:
-            messagebox.showerror(APP_NAME, "Пароли не совпадают.")
+            error(self, "Пароли не совпадают.")
             return
         self._new_pw_hash = hash_password(a)
         self._update_pw_label()
@@ -338,73 +356,65 @@ class TemplatePage(ctk.CTkFrame):
         self._update_pw_label()
 
     def _fill_backups(self):
-        self._backups = {}
+        self.backup_combo.clear()
         for b in self.s.list_backups():
             try:
-                label = datetime.strptime(b.stem[:19], "%Y-%m-%d_%H-%M-%S").strftime("%d.%m.%Y  %H:%M:%S")
+                text = datetime.strptime(b.stem[:19], "%Y-%m-%d_%H-%M-%S").strftime("%d.%m.%Y  %H:%M:%S")
             except ValueError:
-                label = b.stem
-            while label in self._backups:
-                label += " "
-            self._backups[label] = b
-        values = list(self._backups) or ["Копий пока нет"]
-        self.backup_menu.configure(values=values)
-        self.backup_menu.set(values[0])
+                text = b.stem
+            self.backup_combo.addItem(text, str(b))
+        if not self.backup_combo.count():
+            self.backup_combo.addItem("Копий пока нет", None)
 
     def preview(self):
         vals = {**self.s.values, **self.collect()}
-        inv, meta = demo_invoice()
+        inv, meta = demo_invoice(vals)
         out = Path(tempfile.gettempdir()) / f"КП_предпросмотр_{datetime.now():%H%M%S}.xlsx"
         try:
-            build_kp(inv, meta, vals, {k: self._image_for(k) for k in IMAGE_KINDS}, out)
+            build_kp(inv, meta, vals, {k: self._image_for(k) for k in IMAGE_KINDS}, out, self.s.blocks_dir)
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror(APP_NAME, f"Ошибка предпросмотра:\n{e}")
+            error(self, f"Ошибка предпросмотра:\n{e}")
             return
-        open_path(out)
+        open_path(out, self)
+
+    def _changed(self):
+        self.load_values()
+        if self.on_saved:
+            self.on_saved()
 
     def save(self):
         vals = self.collect()
         if not vals["company_name"]:
-            messagebox.showerror(APP_NAME, "Укажите краткое название компании.")
+            error(self, "Укажите краткое название компании.")
             return
-        if not messagebox.askyesno(APP_NAME, "Изменения применятся ко всем будущим коммерческим предложениям.\n\n"
-                                             "Текущие настройки будут сохранены в резервную копию. Продолжить?",
-                                   icon="warning"):
+        if not ask(self, "Изменения применятся ко всем будущим коммерческим предложениям.\n\n"
+                         "Текущие настройки будут сохранены в резервную копию. Продолжить?", warning=True):
             return
         self.s.save(vals)
         for kind, new in self.new_images.items():
             if new is not None:
                 self.s.set_image(kind, new or None)
-        self.load_values()
-        if self.on_saved:
-            self.on_saved()
-        messagebox.showinfo(APP_NAME, "Шаблон сохранён.")
-
-    def restore_backup(self):
-        label = self.backup_menu.get()
-        b = self._backups.get(label)
-        if not b:
-            return
-        if messagebox.askyesno(APP_NAME, f"Восстановить шаблон из копии «{label.strip()}»?\n"
-                                         "Текущие настройки тоже будут сохранены в копию."):
-            self.s.restore(b)
-            self.load_values()
-            if self.on_saved:
-                self.on_saved()
-            messagebox.showinfo(APP_NAME, "Шаблон восстановлен.")
+        self._changed()
+        info(self, "Шаблон сохранён.")
 
     def import_profile(self):
         if import_settings(self, self.s):
-            self.load_values()
-            if self.on_saved:
-                self.on_saved()
+            self._changed()
+
+    def restore_backup(self):
+        path = self.backup_combo.currentData()
+        if not path:
+            return
+        if ask(self, f"Восстановить шаблон из копии «{self.backup_combo.currentText().strip()}»?\n"
+                     "Текущие настройки тоже будут сохранены в копию."):
+            self.s.restore(Path(path))
+            self._changed()
+            info(self, "Шаблон восстановлен.")
 
     def reset_defaults(self):
-        if messagebox.askyesno(APP_NAME, "Очистить контакты и тексты шаблона и вернуть исходные настройки?\n"
-                                         "Логотипы и печать останутся.\n\n"
-                                         "Текущие настройки будут сохранены в резервную копию.", icon="warning"):
+        if ask(self, "Очистить контакты и тексты шаблона и вернуть исходные настройки?\n"
+                     "Логотипы и печать останутся.\n\n"
+                     "Текущие настройки будут сохранены в резервную копию.", warning=True):
             self.s.reset_to_defaults()
-            self.load_values()
-            if self.on_saved:
-                self.on_saved()
-            messagebox.showinfo(APP_NAME, "Шаблон сброшен к исходным настройкам.")
+            self._changed()
+            info(self, "Шаблон сброшен к исходным настройкам.")

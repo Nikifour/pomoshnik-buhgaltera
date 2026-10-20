@@ -1,136 +1,315 @@
-"""Общие элементы интерфейса."""
+"""Общие элементы интерфейса на Qt."""
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
-from tkinter import messagebox
+from typing import Callable
 
-import customtkinter as ctk
+from PySide6.QtCore import (Property, QEasingCurve, QObject, QPropertyAnimation, QRectF, QSize, Qt,
+                            Signal)
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import (QAbstractButton, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
-from core.settings_store import APP_NAME, resource_path
+from core.settings_store import APP_NAME
 from ui import theme as T
 
 
-def open_path(p: Path):
-    try:
-        os.startfile(str(p))  # noqa: S606 — Windows
-    except OSError as e:
-        messagebox.showerror(APP_NAME, f"Не удалось открыть:\n{p}\n\n{e}")
+# ---------------------------------------------------------------- простые элементы
+def label(text: str = "", *, name: str | None = None, muted=False, small=False, wrap=False) -> QLabel:
+    lb = QLabel(text)
+    if name:
+        lb.setObjectName(name)
+    if muted:
+        lb.setProperty("muted", True)
+    if small:
+        lb.setProperty("small", True)
+    lb.setWordWrap(wrap)
+    return lb
 
 
-class Card(ctk.CTkFrame):
-    """Белая карточка с заголовком."""
+def button(text: str, slot: Callable | None = None, *, primary=False, large=False,
+           width: int | None = None) -> QPushButton:
+    b = QPushButton(text)
+    b.setCursor(Qt.PointingHandCursor)
+    if primary:
+        b.setProperty("kind", "primary")
+    if large:
+        b.setProperty("size", "large")
+    if width:
+        b.setMinimumWidth(width)
+    if slot:
+        b.clicked.connect(lambda checked=False: slot())
+    return b
 
-    def __init__(self, master, title: str = "", subtitle: str = "", **kw):
-        super().__init__(master, fg_color=T.CARD, corner_radius=12, border_width=1,
-                         border_color=T.BORDER, **kw)
-        self.columnconfigure(0, weight=1)
-        self.body_row = 0
+
+def hbox(*widgets, spacing=8, margins=(0, 0, 0, 0)) -> QHBoxLayout:
+    """Горизонтальный ряд: виджеты, "stretch" — растяжка, число — отступ."""
+    lay = QHBoxLayout()
+    lay.setSpacing(spacing)
+    lay.setContentsMargins(*margins)
+    for w in widgets:
+        if isinstance(w, str) and w == "stretch":
+            lay.addStretch(1)
+        elif isinstance(w, int):
+            lay.addSpacing(w)
+        else:
+            lay.addWidget(w)
+    return lay
+
+
+def repolish(w: QWidget):
+    """После смены динамического свойства (setProperty) Qt нужно перечитать стиль."""
+    w.style().unpolish(w)
+    w.style().polish(w)
+    w.update()
+
+
+class Card(QFrame):
+    """Карточка с необязательным заголовком; содержимое добавляется в card.body."""
+
+    def __init__(self, title: str = "", subtitle: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 16, 20, 18)
+        outer.setSpacing(4)
+        self.title_label = label(title, name="h2")
         if title:
-            ctk.CTkLabel(self, text=title, font=T.font(15, "bold"), text_color=T.TEXT, anchor="w").grid(
-                row=0, column=0, sticky="ew", padx=20, pady=(16, 0))
-            self.body_row = 1
+            outer.addWidget(self.title_label)
         if subtitle:
-            ctk.CTkLabel(self, text=subtitle, font=T.font(12), text_color=T.MUTED, anchor="w").grid(
-                row=1, column=0, sticky="ew", padx=20)
-            self.body_row = 2
+            outer.addWidget(label(subtitle, muted=True, small=True, wrap=True))
+        if title or subtitle:
+            outer.addSpacing(8)
+        self.body = QVBoxLayout()
+        self.body.setSpacing(8)
+        outer.addLayout(self.body)
 
 
-def primary_button(master, text, command, **kw):
-    kw.setdefault("height", 40)
-    return ctk.CTkButton(master, text=text, command=command, fg_color=T.BRAND, hover_color=T.BRAND_HOVER,
-                         font=T.font(13, "bold"), corner_radius=8, **kw)
-
-
-def secondary_button(master, text, command, **kw):
-    kw.setdefault("height", 36)
-    return ctk.CTkButton(master, text=text, command=command, fg_color="transparent", border_width=1,
-                         border_color=T.BORDER, text_color=T.TEXT, hover_color=T.BORDER,
-                         font=T.font(13), corner_radius=8, **kw)
-
-
-def page_header(master, title: str, subtitle: str = "") -> ctk.CTkFrame:
-    f = ctk.CTkFrame(master, fg_color="transparent")
-    ctk.CTkLabel(f, text=title, font=T.font(24, "bold"), text_color=T.TEXT, anchor="w").pack(anchor="w")
+def page_header(title: str, subtitle: str = "") -> QWidget:
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(2)
+    lay.addWidget(label(title, name="h1"))
     if subtitle:
-        ctk.CTkLabel(f, text=subtitle, font=T.font(13), text_color=T.MUTED, anchor="w").pack(anchor="w")
-    return f
+        lay.addWidget(label(subtitle, muted=True))
+    return w
 
 
-class Dialog(ctk.CTkToplevel):
-    """Модальное окно поверх главного."""
-
-    def __init__(self, master, title: str, width=460, height=240):
-        super().__init__(master)
-        self.title(title)
-        self.resizable(False, False)
-        self.configure(fg_color=T.BG)
-        self.transient(master.winfo_toplevel())
-        x = master.winfo_rootx() + (master.winfo_width() - width) // 2
-        y = master.winfo_rooty() + (master.winfo_height() - height) // 3
-        self.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
-        icon = resource_path("assets/icon.ico")
-        if icon.exists():
-            # customtkinter ставит свою иконку через 200 мс — перебиваем позже
-            self.after(250, lambda: self.iconbitmap(str(icon)))
-        self.after(100, self._grab)
-
-    def _grab(self):
-        try:
-            self.grab_set()
-            self.focus_force()
-        except Exception:  # noqa: BLE001 — окно уже закрыто
-            pass
+def scroll_area(inner: QWidget) -> QScrollArea:
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    sa.setFrameShape(QFrame.NoFrame)
+    sa.setWidget(inner)
+    return sa
 
 
-class PasswordDialog(Dialog):
-    def __init__(self, master, prompt: str):
-        super().__init__(master, APP_NAME, 400, 190)
-        self.value: str | None = None
-        ctk.CTkLabel(self, text=prompt, font=T.font(14), text_color=T.TEXT).pack(padx=24, pady=(24, 10), anchor="w")
-        self.entry = ctk.CTkEntry(self, show="•", height=38, font=T.font(14))
-        self.entry.pack(fill="x", padx=24)
-        self.entry.bind("<Return>", lambda e: self._ok())
-        self.after(300, self.entry.focus_set)
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(fill="x", padx=24, pady=20)
-        primary_button(row, "OK", self._ok, width=100, height=36).pack(side="right")
-        secondary_button(row, "Отмена", self.destroy, width=100).pack(side="right", padx=8)
+# ---------------------------------------------------------------- переключатель
+class Toggle(QAbstractButton):
+    """Переключатель в стиле Windows 11 с плавной анимацией."""
 
-    def _ok(self):
-        self.value = self.entry.get()
-        self.destroy()
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setText(text)
+        self._pos = 0.0
+        self._anim = QPropertyAnimation(self, b"knob", self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.toggled.connect(self._animate)
 
-    @classmethod
-    def ask(cls, master, prompt: str) -> str | None:
-        d = cls(master, prompt)
-        master.wait_window(d)
-        return d.value
+    def _get_knob(self):
+        return self._pos
+
+    def _set_knob(self, v):
+        self._pos = v
+        self.update()
+
+    knob = Property(float, _get_knob, _set_knob)
+
+    def _animate(self, on):
+        self._anim.stop()
+        self._anim.setEndValue(1.0 if on else 0.0)
+        self._anim.start()
+
+    def set_value(self, on: bool):
+        """Установить без анимации (при загрузке настроек)."""
+        self.blockSignals(True)
+        self.setChecked(bool(on))
+        self.blockSignals(False)
+        self._anim.stop()
+        self._pos = 1.0 if on else 0.0
+        self.update()
+
+    def sizeHint(self):  # noqa: N802
+        w = 46 + (self.fontMetrics().horizontalAdvance(self.text()) + 12 if self.text() else 0)
+        return QSize(w, 28)
+
+    def paintEvent(self, _):  # noqa: N802
+        c = T.colors()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        track = QRectF(1, (self.height() - 22) / 2, 42, 22)
+        on = QColor(c["brand"])
+        off = QColor("#4B4D55" if T.is_dark() else "#C9CDD3")
+        t = self._pos
+        col = QColor(int(off.red() + (on.red() - off.red()) * t),
+                     int(off.green() + (on.green() - off.green()) * t),
+                     int(off.blue() + (on.blue() - off.blue()) * t))
+        if not self.isEnabled():
+            col.setAlpha(110)
+        p.setPen(Qt.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(track, 11, 11)
+        p.setBrush(QColor("white"))
+        x = track.left() + 3 + t * (track.width() - 22)
+        p.drawEllipse(QRectF(x, track.top() + 3, 16, 16))
+        if self.text():
+            p.setPen(QColor(c["text"]))
+            p.drawText(QRectF(54, 0, self.width() - 54, self.height()),
+                       Qt.AlignVCenter | Qt.AlignLeft, self.text())
+        p.end()
 
 
-class SwatchRow(ctk.CTkFrame):
-    """Ряд цветных кнопок для выбора цвета; выбранный цвет обведён."""
+# ---------------------------------------------------------------- выбор цвета
+class Swatch(QAbstractButton):
+    """Цветной кружок; выбранный обведён кольцом."""
 
-    def __init__(self, master, colors: list[str], on_pick, selected: str | None = None, size=34):
-        super().__init__(master, fg_color="transparent")
-        self.on_pick = on_pick
+    def __init__(self, color: str, size: int):
+        super().__init__()
+        self.color = color
+        self.selected = False
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(color.upper())
+
+    def paintEvent(self, _):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        if self.selected:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(T.colors()["text"]))
+            p.drawEllipse(r)
+            r = r.adjusted(3, 3, -3, -3)
+            p.setBrush(QColor(T.colors()["card"]))
+            p.drawEllipse(r)
+            r = r.adjusted(2, 2, -2, -2)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(self.color))
+        p.drawEllipse(r)
+        p.end()
+
+
+class SwatchRow(QWidget):
+    picked = Signal(str)
+
+    def __init__(self, colors: list[str], selected: str | None = None, size=34, parent=None):
+        super().__init__(parent)
         self.size = size
+        self.lay = QHBoxLayout(self)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+        self.lay.setSpacing(8)
+        self.buttons: dict[str, Swatch] = {}
         self.set_colors(colors, selected)
 
     def set_colors(self, colors: list[str], selected: str | None = None):
-        for w in self.winfo_children():
-            w.destroy()
+        while self.lay.count():
+            item = self.lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         self.buttons = {}
-        for c in colors:
-            b = ctk.CTkButton(self, text="", width=self.size, height=self.size, corner_radius=self.size // 2,
-                              fg_color=c, hover_color=c, border_width=0, border_color=T.TEXT,
-                              command=lambda col=c: self.select(col, notify=True))
-            b.pack(side="left", padx=(0, 8))
-            self.buttons[c.upper()] = b
+        for col in colors:
+            b = Swatch(col, self.size)
+            b.clicked.connect(lambda checked=False, c=col: (self.select(c), self.picked.emit(c)))
+            self.lay.addWidget(b)
+            self.buttons[col.upper()] = b
+        self.lay.addStretch(1)
         self.select(selected)
 
-    def select(self, color: str | None, notify=False):
+    def select(self, color: str | None):
         for c, b in self.buttons.items():
-            b.configure(border_width=3 if color and c == color.upper() else 0)
-        if notify and color:
-            self.on_pick(color)
+            b.selected = bool(color) and c == color.upper()
+            b.update()
+
+
+# ---------------------------------------------------------------- диалоги
+def _box(parent, icon, text, buttons, default=None):
+    box = QMessageBox(icon, APP_NAME, text, buttons, parent)
+    if default:
+        box.setDefaultButton(default)
+    return box.exec()
+
+
+def info(parent, text: str):
+    _box(parent, QMessageBox.Information, text, QMessageBox.Ok)
+
+
+def warn(parent, text: str):
+    _box(parent, QMessageBox.Warning, text, QMessageBox.Ok)
+
+
+def error(parent, text: str):
+    _box(parent, QMessageBox.Critical, text, QMessageBox.Ok)
+
+
+def ask(parent, text: str, warning=False) -> bool:
+    icon = QMessageBox.Warning if warning else QMessageBox.Question
+    return _box(parent, icon, text, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
+
+
+def ask_cancel(parent, text: str) -> bool | None:
+    """Да / Нет / Отмена → True / False / None."""
+    r = _box(parent, QMessageBox.Question, text, QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+    return None if r == QMessageBox.Cancel else r == QMessageBox.Yes
+
+
+def ask_password(parent, prompt: str) -> str | None:
+    text, ok = QInputDialog.getText(parent, APP_NAME, prompt, QLineEdit.Password)
+    return text if ok else None
+
+
+def open_path(p: Path, parent=None):
+    try:
+        os.startfile(str(p))  # noqa: S606 — Windows
+    except OSError as e:
+        error(parent, f"Не удалось открыть:\n{p}\n\n{e}")
+
+
+# ---------------------------------------------------------------- фоновые задачи
+class _Bridge(QObject):
+    done = Signal(object, object)
+    progress = Signal(float)
+
+
+_running: set = set()
+
+
+def run_in_background(fn: Callable, on_done: Callable, on_progress: Callable | None = None):
+    """Выполнить fn в отдельном потоке; результат приходит в интерфейс через сигнал Qt.
+
+    on_done(результат, ошибка). Если передан on_progress, fn получает функцию progress(0..1).
+    """
+    bridge = _Bridge()
+    _running.add(bridge)
+
+    def finished(res, err):
+        _running.discard(bridge)
+        on_done(res, err)
+
+    bridge.done.connect(finished)
+    if on_progress:
+        bridge.progress.connect(on_progress)
+
+    def worker():
+        try:
+            res = fn(bridge.progress.emit) if on_progress else fn()
+            bridge.done.emit(res, None)
+        except Exception as e:  # noqa: BLE001
+            bridge.done.emit(None, e)
+
+    threading.Thread(target=worker, daemon=True).start()

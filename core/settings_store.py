@@ -42,12 +42,16 @@ DEFAULTS = {
         "и предлагает ознакомиться с предложением по следующим позициям:"
     ),
     "conditions": (
-        "Цены указаны в тенге с учётом НДС\n"
+        "Цены указаны в теңге с учётом НДС\n"
         "Предложение не является счётом на оплату — для оплаты запросите счёт у менеджера\n"
         "Оплата: 100% предоплата по выставленному счёту\n"
         "Наличие товара и цены уточняйте у менеджера при запросе счёта"
     ),
     "footer": "",
+    "from_details": "",          # мелкая строка под «От: компания» (БИН, адрес…)
+    "signature_text": "",        # подпись внизу КП; пусто — собирается из контактов
+    "signature_rich": [],        # подпись с оформлением (core/richtext.py); главнее signature_text
+    "greeting_rich": [],         # приветствие с оформлением; пусто — простой текст greeting
     "accent_color": DEFAULT_ACCENT,
     "show_stamp": True,
     "validity_days": 10,
@@ -57,7 +61,8 @@ DEFAULTS = {
     "fill_buyer": True,          # «Кому» — покупатель из счёта
     "fill_buyer_details": True,  # БИН и адрес покупателя
     "show_vat": True,            # строки «Итого» и «В т.ч. НДС»
-    "show_amount_words": True,   # «Всего наименований…» и сумма прописью
+    "show_amount_words": True,   # устарело: теперь это видимость блока «Сумма прописью» в макете
+    "layout": [],                # макет КП из блоков (core/layout.py); пустой — стандартный
     "output_dir": str(Path.home() / "Documents" / "Коммерческие предложения"),
     "also_pdf": True,
     "editor_password_hash": "",
@@ -102,6 +107,7 @@ class Settings:
         self.file = self.dir / "settings.json"
         self.state_file = self.dir / "state.json"
         self.backup_dir = self.dir / "backups"
+        self.blocks_dir = self.dir / "blocks"  # картинки своих блоков конструктора
         self.values = copy.deepcopy(DEFAULTS)
         self.load()
 
@@ -122,6 +128,28 @@ class Settings:
             own.unlink(missing_ok=True)
             return
         Image.open(src).convert("RGBA").save(own)
+
+    def add_block_image(self, src: str | Path) -> str:
+        """Сохранить картинку для блока конструктора в data/blocks, вернуть имя файла."""
+        from PIL import Image
+
+        from core.layout import new_id
+        self.blocks_dir.mkdir(exist_ok=True)
+        name = f"{new_id()}.png"
+        Image.open(src).convert("RGBA").save(self.blocks_dir / name)
+        return name
+
+    def block_files(self) -> list[Path]:
+        return sorted(self.blocks_dir.glob("*.png")) if self.blocks_dir.exists() else []
+
+    def cleanup_block_images(self):
+        """Удалить картинки блоков, на которые больше не ссылается сохранённый макет
+        (в резервных копиях они остаются)."""
+        from core.layout import normalize, referenced_images
+        used = referenced_images(normalize(self.values.get("layout"), self.values))
+        for f in self.block_files():
+            if f.name not in used:
+                f.unlink(missing_ok=True)
 
     # --- загрузка / сохранение -----------------------------------------------
     def load(self):
@@ -153,6 +181,8 @@ class Settings:
             for f in DATA_FILES:
                 if (self.dir / f).exists():
                     z.write(self.dir / f, f)
+            for f in self.block_files():
+                z.write(f, f"blocks/{f.name}")
         for old in self.list_backups()[MAX_BACKUPS:]:
             old.unlink(missing_ok=True)
 
@@ -167,10 +197,17 @@ class Settings:
                 (self.dir / f).unlink(missing_ok=True)
 
     def restore(self, backup: Path):
+        from core.layout import IMAGE_NAME_RE
         self.backup()
         self._clear_files()
         with zipfile.ZipFile(backup) as z:
-            z.extractall(self.dir)
+            # распаковываем только известные файлы — никаких путей за пределы папки data
+            for name in z.namelist():
+                if name in DATA_FILES:
+                    (self.dir / name).write_bytes(z.read(name))
+                elif name.startswith("blocks/") and IMAGE_NAME_RE.match(name[len("blocks/"):]):
+                    self.blocks_dir.mkdir(exist_ok=True)
+                    (self.blocks_dir / name[len("blocks/"):]).write_bytes(z.read(name))
         self.values = copy.deepcopy(DEFAULTS)
         self.load()
 

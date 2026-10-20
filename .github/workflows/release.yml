@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check no company data in repository
         shell: pwsh
@@ -24,7 +24,7 @@ jobs:
           }
           if ($bad) { Write-Error ("Найдены файлы, которых не должно быть в репозитории:`n" + ($bad -join "`n")); exit 1 }
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -43,7 +43,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
           --name Pomoshnik-Buhgaltera --icon assets/icon.ico
-          --add-data "assets;assets" --collect-data customtkinter app.py
+          --add-data "assets;assets" --exclude-module tkinter app.py
 
       - name: Build installer
         shell: pwsh

@@ -1,126 +1,155 @@
 """Страница «Новое КП»: счёт -> данные КП -> файл."""
 from __future__ import annotations
 
-import threading
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 
-import customtkinter as ctk
+from PySide6.QtCore import QDate, Qt
+from PySide6.QtWidgets import (QAbstractItemView, QDateEdit, QDialog, QFileDialog, QFrame, QGridLayout,
+                               QHeaderView, QLineEdit, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core.invoice_parser import Invoice, InvoiceError, parse_invoice
 from core.kp_builder import KPMeta, build_kp, export_pdf, safe_filename
-from core.settings_store import APP_NAME, Settings
-from ui import theme as T
-from ui.widgets import Card, Dialog, open_path, page_header, primary_button, secondary_button
+from core.settings_store import Settings
+from ui.widgets import (Card, Toggle, button, error, hbox, label, open_path, page_header, repolish,
+                        run_in_background, warn, ask)
+
+INVOICE_EXT = (".xlsx", ".xlsm", ".xls")
 
 
 def money(v: float) -> str:
     return f"{v:,.2f}".replace(",", " ").replace(".", ",")
 
 
-class NewKPPage(ctk.CTkFrame):
-    def __init__(self, master, settings: Settings, on_created=None):
-        super().__init__(master, fg_color="transparent")
+class DropZone(QFrame):
+    """Карточка выбора счёта: кнопка или перетаскивание файла мышкой."""
+
+    def __init__(self, on_file, on_click):
+        super().__init__()
+        self.setObjectName("dropzone")
+        self.setAcceptDrops(True)
+        self.on_file = on_file
+        lay = QGridLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setHorizontalSpacing(18)
+        self.btn = button("📄  Выбрать счёт на оплату", on_click, primary=True, large=True)
+        lay.addWidget(self.btn, 0, 0, 2, 1)
+        self.title = label("Счёт не выбран", name="h2")
+        self.sub = label("Нажмите кнопку или перетащите сюда файл Excel (.xlsx / .xls), выгруженный из 1С",
+                         muted=True, wrap=True)
+        lay.addWidget(self.title, 0, 1)
+        lay.addWidget(self.sub, 1, 1)
+        lay.setColumnStretch(1, 1)
+
+    def _files(self, event):
+        return [u.toLocalFile() for u in event.mimeData().urls()
+                if u.toLocalFile().lower().endswith(INVOICE_EXT)]
+
+    def _set_active(self, on):
+        self.setProperty("active", on)
+        repolish(self)
+
+    def dragEnterEvent(self, e):  # noqa: N802
+        if self._files(e):
+            e.acceptProposedAction()
+            self._set_active(True)
+
+    def dragLeaveEvent(self, e):  # noqa: N802
+        self._set_active(False)
+
+    def dropEvent(self, e):  # noqa: N802
+        self._set_active(False)
+        files = self._files(e)
+        if files:
+            self.on_file(files[0])
+
+
+class NewKPPage(QWidget):
+    def __init__(self, settings: Settings, on_created=None):
+        super().__init__()
+        self.setObjectName("page")
         self.s = settings
         self.on_created = on_created
         self.invoice: Invoice | None = None
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
 
-        page_header(self, "Новое коммерческое предложение",
-                    "Выберите счёт на оплату — данные перенесутся в КП автоматически").grid(
-            row=0, column=0, sticky="ew", pady=(0, 16))
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+        root.addWidget(page_header("Новое коммерческое предложение",
+                                   "Выберите счёт на оплату — данные перенесутся в КП автоматически"))
+        root.addSpacing(4)
 
         # --- 1. Счёт
-        c1 = Card(self)
-        c1.grid(row=1, column=0, sticky="ew")
-        c1.columnconfigure(1, weight=1)
-        primary_button(c1, "📄  Выбрать счёт на оплату", self.choose_invoice, width=240, height=44).grid(
-            row=0, column=0, padx=20, pady=16)
-        info = ctk.CTkFrame(c1, fg_color="transparent")
-        info.grid(row=0, column=1, sticky="ew", padx=(0, 20))
-        self.lbl_invoice = ctk.CTkLabel(info, text="Счёт не выбран", font=T.font(14, "bold"),
-                                        text_color=T.TEXT, anchor="w")
-        self.lbl_invoice.pack(anchor="w")
-        self.lbl_file = ctk.CTkLabel(info, text="Файл Excel (.xlsx / .xls), выгруженный из 1С",
-                                     font=T.font(12), text_color=T.MUTED, anchor="w")
-        self.lbl_file.pack(anchor="w")
+        self.drop = DropZone(self.load_invoice, self.choose_invoice)
+        root.addWidget(self.drop)
 
         # --- 2. Данные КП
-        c2 = Card(self, "Данные КП")
-        c2.grid(row=2, column=0, sticky="ew", pady=12)
-        form = ctk.CTkFrame(c2, fg_color="transparent")
-        form.grid(row=c2.body_row, column=0, sticky="ew", padx=20, pady=(8, 16))
-        form.columnconfigure(1, weight=1)
-        self.var_buyer = ctk.StringVar()
-        self.var_details = ctk.StringVar()
-        self.var_number = ctk.StringVar()
-        self.var_date = ctk.StringVar(value=date.today().strftime("%d.%m.%Y"))
-        self.var_pdf = ctk.BooleanVar(value=bool(self.s["also_pdf"]))
-
-        def label(text, r, c=0):
-            ctk.CTkLabel(form, text=text, font=T.font(13), text_color=T.MUTED, anchor="w").grid(
-                row=r, column=c, sticky="w", padx=(0, 12), pady=4)
-
-        label("Кому", 0)
-        ctk.CTkEntry(form, textvariable=self.var_buyer, height=34, font=T.font(13)).grid(
-            row=0, column=1, columnspan=5, sticky="ew", pady=4)
-        label("Реквизиты", 1)
-        ctk.CTkEntry(form, textvariable=self.var_details, height=34, font=T.font(13)).grid(
-            row=1, column=1, columnspan=5, sticky="ew", pady=4)
-        label("№ КП", 2)
-        row = ctk.CTkFrame(form, fg_color="transparent")
-        row.grid(row=2, column=1, columnspan=5, sticky="ew", pady=4)
-        ctk.CTkEntry(row, textvariable=self.var_number, width=90, height=34, font=T.font(13)).pack(side="left")
-        ctk.CTkLabel(row, text="Дата", font=T.font(13), text_color=T.MUTED).pack(side="left", padx=(24, 12))
-        ctk.CTkEntry(row, textvariable=self.var_date, width=120, height=34, font=T.font(13)).pack(side="left")
-        ctk.CTkSwitch(row, text="Сохранить также в PDF", variable=self.var_pdf, font=T.font(13),
-                      progress_color=T.BRAND).pack(side="right")
+        c2 = Card("Данные КП")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+        self.ed_buyer = QLineEdit()
+        self.ed_details = QLineEdit()
+        self.ed_number = QLineEdit()
+        self.ed_number.setFixedWidth(130)
+        self.ed_date = QDateEdit()
+        self.ed_date.setCalendarPopup(True)
+        self.ed_date.setDisplayFormat("dd.MM.yyyy")
+        self.ed_date.setDate(QDate.currentDate())
+        self.ed_date.setFixedWidth(140)
+        self.tg_pdf = Toggle("Сохранить также в PDF")
+        grid.addWidget(label("Кому", muted=True), 0, 0)
+        grid.addWidget(self.ed_buyer, 0, 1)
+        grid.addWidget(label("Реквизиты", muted=True), 1, 0)
+        grid.addWidget(self.ed_details, 1, 1)
+        grid.addWidget(label("№ КП", muted=True), 2, 0)
+        grid.addLayout(hbox(self.ed_number, 16, label("Дата", muted=True), self.ed_date, "stretch", self.tg_pdf), 2, 1)
+        grid.setColumnStretch(1, 1)
+        c2.body.addLayout(grid)
+        root.addWidget(c2)
 
         # --- 3. Позиции
-        c3 = Card(self, "Позиции")
-        c3.grid(row=3, column=0, sticky="nsew")
-        c3.rowconfigure(c3.body_row, weight=1)
-        holder = ctk.CTkFrame(c3, fg_color="transparent")
-        holder.grid(row=c3.body_row, column=0, sticky="nsew", padx=20, pady=(8, 16))
-        holder.columnconfigure(0, weight=1)
-        holder.rowconfigure(0, weight=1)
-        cols = ("no", "name", "qty", "unit", "price", "total")
-        self.tree = ttk.Treeview(holder, columns=cols, show="headings", style="KP.Treeview", height=6)
-        for c, title, w, anchor in [("no", "№", 40, "center"), ("name", "Наименование", 380, "w"),
-                                    ("qty", "Кол-во", 70, "center"), ("unit", "Ед.", 50, "center"),
-                                    ("price", "Цена", 110, "e"), ("total", "Сумма", 120, "e")]:
-            self.tree.heading(c, text=title, anchor=anchor)
-            self.tree.column(c, width=w, minwidth=w if c != "name" else 150, anchor=anchor, stretch=(c == "name"))
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        sb = ctk.CTkScrollbar(holder, command=self.tree.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=sb.set)
-        self.empty = ctk.CTkLabel(holder, text="Здесь появятся позиции из счёта", font=T.font(13),
-                                  text_color=T.MUTED)
-        self.empty.place(relx=0.5, rely=0.55, anchor="center")
+        c3 = Card("Позиции")
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["№", "Наименование", "Кол-во", "Ед.", "Цена", "Сумма"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setHighlightSections(False)
+        for col, align in ((0, Qt.AlignCenter), (2, Qt.AlignCenter), (3, Qt.AlignCenter),
+                           (4, Qt.AlignRight), (5, Qt.AlignRight)):
+            self.table.horizontalHeaderItem(col).setTextAlignment(align | Qt.AlignVCenter)
+        self.empty = label("Здесь появятся позиции из счёта", muted=True)
+        self.empty.setAlignment(Qt.AlignCenter)
+        c3.body.addWidget(self.empty)
+        c3.body.addWidget(self.table, 1)
+        self.table.hide()
+        root.addWidget(c3, 1)
 
         # --- Итог
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=4, column=0, sticky="ew", pady=(16, 0))
-        totals = ctk.CTkFrame(bar, fg_color="transparent")
-        totals.pack(side="left")
-        self.lbl_total = ctk.CTkLabel(totals, text="", font=T.font(20, "bold"), text_color=T.TEXT, anchor="w")
-        self.lbl_total.pack(anchor="w")
-        self.lbl_vat = ctk.CTkLabel(totals, text="", font=T.font(12), text_color=T.MUTED, anchor="w")
-        self.lbl_vat.pack(anchor="w")
-        self.btn_make = primary_button(bar, "Сформировать КП  →", self.make_kp, width=230, height=48,
-                                       state="disabled")
-        self.btn_make.pack(side="right")
+        self.lbl_total = label("", name="big")
+        self.lbl_vat = label("", muted=True)
+        totals = QVBoxLayout()
+        totals.setSpacing(0)
+        totals.addWidget(self.lbl_total)
+        totals.addWidget(self.lbl_vat)
+        self.btn_make = button("Сформировать КП  →", self.make_kp, primary=True, large=True, width=230)
+        self.btn_make.setEnabled(False)
+        bar = hbox("stretch", self.btn_make)
+        bar.insertLayout(0, totals)
+        root.addLayout(bar)
+        self.refresh()
 
     # ------------------------------------------------------------------
     def choose_invoice(self):
-        path = filedialog.askopenfilename(
-            title="Выберите счёт на оплату",
-            filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("Все файлы", "*.*")],
-            initialdir=str(Path.home() / "Desktop"),
-        )
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите счёт на оплату", str(Path.home() / "Desktop"),
+                                              "Excel (*.xlsx *.xlsm *.xls);;Все файлы (*.*)")
         if path:
             self.load_invoice(path)
 
@@ -128,99 +157,99 @@ class NewKPPage(ctk.CTkFrame):
         try:
             inv = parse_invoice(path)
         except InvoiceError as e:
-            messagebox.showerror(APP_NAME, str(e))
+            error(self, str(e))
             return
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror(APP_NAME, f"Не удалось прочитать счёт:\n{e}")
+            error(self, f"Не удалось прочитать счёт:\n{e}")
             return
         self.invoice = inv
-        self.lbl_invoice.configure(text=f"Счёт на оплату № {inv.number}"
-                                        + (f" от {inv.date:%d.%m.%Y}" if inv.date else ""))
-        self.lbl_file.configure(text=Path(path).name)
+        self.drop.title.setText(f"Счёт на оплату № {inv.number}" + (f" от {inv.date:%d.%m.%Y}" if inv.date else ""))
+        self.drop.sub.setText(Path(path).name)
         # что брать из счёта — настраивается в «Шаблон КП» → «Из счёта»
         s = self.s
-        self.var_buyer.set(inv.buyer if s["fill_buyer"] else "")
-        self.var_details.set(inv.buyer_details if s["fill_buyer_details"] else "")
+        self.ed_buyer.setText(inv.buyer if s["fill_buyer"] else "")
+        self.ed_details.setText(inv.buyer_details if s["fill_buyer_details"] else "")
         # № КП = № счёта; если выключено или в счёте номера нет — свой счётчик
-        self.var_number.set(inv.number if s["fill_number"] and inv.number else str(s.next_number()))
-        kp_date = inv.date if s["fill_date"] and inv.date else date.today()
-        self.var_date.set(kp_date.strftime("%d.%m.%Y"))
-        self.tree.delete(*self.tree.get_children())
-        for i, it in enumerate(inv.items, 1):
+        self.ed_number.setText(inv.number if s["fill_number"] and inv.number else str(s.next_number()))
+        d = inv.date if s["fill_date"] and inv.date else date.today()
+        self.ed_date.setDate(QDate(d.year, d.month, d.day))
+
+        self.table.setRowCount(len(inv.items))
+        for r, it in enumerate(inv.items):
             qty = int(it.qty) if float(it.qty).is_integer() else it.qty
-            self.tree.insert("", "end", values=(i, it.name, qty, it.unit, money(it.price), money(it.total)))
-        self.empty.place_forget()
-        self.lbl_total.configure(text=f"{money(inv.total)} KZT")
+            for col, val, align in ((0, r + 1, Qt.AlignCenter), (1, it.name, Qt.AlignLeft),
+                                    (2, qty, Qt.AlignCenter), (3, it.unit, Qt.AlignCenter),
+                                    (4, money(it.price), Qt.AlignRight), (5, money(it.total), Qt.AlignRight)):
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(align | Qt.AlignVCenter)
+                self.table.setItem(r, col, item)
+        self.empty.hide()
+        self.table.show()
+        self.lbl_total.setText(f"{money(inv.total)} KZT")
         vat = f"  ·  в т.ч. НДС {money(inv.vat)}" if inv.vat is not None else ""
-        self.lbl_vat.configure(text=f"Позиций: {len(inv.items)}{vat}")
-        self.btn_make.configure(state="normal")
+        self.lbl_vat.setText(f"Позиций: {len(inv.items)}{vat}")
+        self.btn_make.setEnabled(True)
 
     def make_kp(self):
         if not self.invoice:
             return
-        number = self.var_number.get().strip()
-        try:
-            kp_date = datetime.strptime(self.var_date.get().strip(), "%d.%m.%Y").date()
-        except ValueError:
-            messagebox.showerror(APP_NAME, "Проверьте дату КП (ДД.ММ.ГГГГ).")
-            return
+        number = self.ed_number.text().strip()
         if not number:
-            messagebox.showerror(APP_NAME, "Укажите № КП.")
+            error(self, "Укажите № КП.")
             return
-        meta = KPMeta(number, kp_date, self.var_buyer.get().strip(), self.var_details.get().strip())
+        qd = self.ed_date.date()
+        kp_date = date(qd.year(), qd.month(), qd.day())
+        meta = KPMeta(number, kp_date, self.ed_buyer.text().strip(), self.ed_details.text().strip())
         short_buyer = meta.buyer.replace("Товарищество с ограниченной ответственностью", "ТОО")
         name = f"КП № {number} от {kp_date:%d.%m.%Y}" + (f" - {short_buyer}" if short_buyer else "")
         out = Path(self.s["output_dir"]) / f"{safe_filename(name)}.xlsx"
-        if out.exists() and not messagebox.askyesno(APP_NAME, f"Файл уже существует:\n{out.name}\n\nЗаменить?"):
+        if out.exists() and not ask(self, f"Файл уже существует:\n{out.name}\n\nЗаменить?"):
             return
         try:
-            build_kp(self.invoice, meta, self.s.values, self.s.images(), out)
+            build_kp(self.invoice, meta, self.s.values, self.s.images(), out, self.s.blocks_dir)
         except PermissionError:
-            messagebox.showerror(APP_NAME, f"Не удалось записать файл — возможно, он открыт в Excel:\n{out}")
+            error(self, f"Не удалось записать файл — возможно, он открыт в Excel:\n{out}")
             return
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror(APP_NAME, f"Ошибка при создании КП:\n{e}")
+            error(self, f"Ошибка при создании КП:\n{e}")
             return
         if number == str(self.s.next_number()):
             self.s.commit_number(int(number))  # номер был из счётчика — сдвигаем счётчик
 
-        if self.var_pdf.get():
-            self.btn_make.configure(state="disabled", text="Сохраняю PDF…")
-            threading.Thread(target=self._pdf_worker, args=(out,), daemon=True).start()
+        if self.tg_pdf.isChecked():
+            self.btn_make.setEnabled(False)
+            self.btn_make.setText("Сохраняю PDF…")
+            run_in_background(lambda: export_pdf(out), lambda pdf, err: self._done(out, pdf, err))
         else:
             self._done(out, None, None)
 
-    def _pdf_worker(self, xlsx: Path):
-        try:
-            pdf, err = export_pdf(xlsx), None
-        except Exception as e:  # noqa: BLE001
-            pdf, err = None, e
-        self.after(0, self._done, xlsx, pdf, err)
-
     def _done(self, xlsx: Path, pdf: Path | None, err: Exception | None):
-        self.btn_make.configure(state="normal", text="Сформировать КП  →")
+        self.btn_make.setEnabled(True)
+        self.btn_make.setText("Сформировать КП  →")
         if err:
-            messagebox.showwarning(APP_NAME, "КП в Excel создано, но PDF сохранить не удалось "
-                                             f"(нужен установленный Microsoft Excel):\n{err}")
+            warn(self, "КП в Excel создано, но PDF сохранить не удалось "
+                       f"(нужен установленный Microsoft Excel):\n{err}")
         if self.on_created:
             self.on_created()
-        DoneDialog(self, xlsx, pdf)
+        DoneDialog(self, xlsx, pdf).exec()
 
     def refresh(self):
-        self.var_pdf.set(bool(self.s["also_pdf"]))
+        self.tg_pdf.set_value(bool(self.s["also_pdf"]))
 
 
-class DoneDialog(Dialog):
-    def __init__(self, master, xlsx: Path, pdf: Path | None):
-        super().__init__(master, "КП готово", 520, 210)
-        ctk.CTkLabel(self, text="✔  Коммерческое предложение создано", font=T.font(17, "bold"),
-                     text_color=T.BRAND_BRIGHT).pack(anchor="w", padx=24, pady=(24, 2))
-        ctk.CTkLabel(self, text=xlsx.name, font=T.font(12), text_color=T.MUTED, wraplength=470,
-                     justify="left").pack(anchor="w", padx=24)
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(fill="x", padx=24, pady=24)
-        primary_button(row, "Открыть в Excel", lambda: open_path(xlsx), width=150, height=38).pack(side="left")
+class DoneDialog(QDialog):
+    def __init__(self, parent, xlsx: Path, pdf: Path | None):
+        super().__init__(parent)
+        self.setWindowTitle("КП готово")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(6)
+        lay.addWidget(label("✔  Коммерческое предложение создано", name="success"))
+        lay.addWidget(label(xlsx.name, muted=True, wrap=True))
+        lay.addSpacing(14)
+        row = [button("Открыть в Excel", lambda: open_path(xlsx, self), primary=True)]
         if pdf:
-            secondary_button(row, "Открыть PDF", lambda: open_path(pdf), width=120).pack(side="left", padx=8)
-        secondary_button(row, "Папка", lambda: open_path(xlsx.parent), width=80).pack(side="left")
-        secondary_button(row, "Закрыть", self.destroy, width=90).pack(side="right")
+            row.append(button("Открыть PDF", lambda: open_path(pdf, self)))
+        row += [button("Папка", lambda: open_path(xlsx.parent, self)), "stretch", button("Закрыть", self.accept)]
+        lay.addLayout(hbox(*row))
+        self.setMinimumWidth(520)

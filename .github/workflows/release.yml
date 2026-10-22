@@ -43,7 +43,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
           --name Pomoshnik-Buhgaltera --icon assets/icon.ico
-          --add-data "assets;assets" --exclude-module tkinter app.py
+          --add-data "assets;assets" --add-data "docs;docs" --exclude-module tkinter app.py
 
       - name: Build installer
         shell: pwsh

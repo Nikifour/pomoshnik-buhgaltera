@@ -63,6 +63,11 @@ DEFAULTS = {
     "show_vat": True,            # строки «Итого» и «В т.ч. НДС»
     "show_amount_words": True,   # устарело: теперь это видимость блока «Сумма прописью» в макете
     "layout": [],                # макет КП из блоков (core/layout.py); пустой — стандартный
+    # статистика КП в Google Таблице (core/stats.py); имя сотрудника хранится отдельно, в state.json
+    "stats_enabled": False,
+    "stats_url": "",
+    "stats_token": "",
+    "stats_sheet_url": "",       # адрес самой таблицы — для кода скрипта и кнопки «Открыть таблицу»
     "output_dir": str(Path.home() / "Documents" / "Коммерческие предложения"),
     "also_pdf": True,
     "editor_password_hash": "",

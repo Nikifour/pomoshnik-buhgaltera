@@ -6,8 +6,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (QAbstractItemView, QDateEdit, QDialog, QFileDialog, QFrame, QGridLayout,
-                               QHeaderView, QLineEdit, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QHeaderView, QInputDialog, QLineEdit, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+from core import stats
 from core.invoice_parser import Invoice, InvoiceError, parse_invoice
 from core.kp_builder import KPMeta, build_kp, export_pdf, safe_filename
 from core.settings_store import Settings
@@ -71,6 +72,7 @@ class NewKPPage(QWidget):
         self.s = settings
         self.on_created = on_created
         self.invoice: Invoice | None = None
+        self._last_meta: KPMeta | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -216,6 +218,7 @@ class NewKPPage(QWidget):
         qd = self.ed_date.date()
         kp_date = date(qd.year(), qd.month(), qd.day())
         meta = KPMeta(number, kp_date, self.ed_buyer.text().strip(), self.ed_details.text().strip())
+        self._last_meta = meta
         short_buyer = meta.buyer.replace("Товарищество с ограниченной ответственностью", "ТОО")
         name = f"КП № {number} от {kp_date:%d.%m.%Y}" + (f" - {short_buyer}" if short_buyer else "")
         out = Path(self.s["output_dir"]) / f"{safe_filename(name)}.xlsx"
@@ -247,7 +250,23 @@ class NewKPPage(QWidget):
                        f"(нужен установленный Microsoft Excel):\n{err}")
         if self.on_created:
             self.on_created()
+        self._send_stats()
         DoneDialog(self, xlsx, pdf).exec()
+
+    def _send_stats(self):
+        """Запись о КП в Google Таблицу (если статистика включена). Сеть — в фоне, без ожидания."""
+        if not stats.enabled(self.s) or not self._last_meta:
+            return
+        if not stats.employee(self.s):
+            name, ok = QInputDialog.getText(
+                self, "Статистика КП", "Как вас записывать в статистику КП?\n"
+                                       "(имя можно поменять: Настройки → Шаблон КП → Статистика)",
+                text=stats.default_employee())
+            if ok and name.strip():
+                self.s.set_state("employee_name", name.strip())
+        inv, meta = self.invoice, self._last_meta
+        stats.record(self.s, meta.number, meta.buyer, inv.total, len(inv.items))
+        stats.flush_in_background(self.s)
 
     def refresh(self):
         self.tg_pdf.set_value(bool(self.s["also_pdf"]))

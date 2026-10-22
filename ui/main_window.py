@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, Q
                                QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget,
                                QVBoxLayout, QWidget)
 
-from core import updater
+from core import stats, updater
 from core.settings_store import APP_NAME, Settings, hash_password, resource_path
 from ui import theme as T
 from ui.page_history import HistoryPage
@@ -15,6 +15,7 @@ from ui.page_designer import DesignerPage
 from ui.page_new import NewKPPage
 from ui.page_template import TemplatePage
 from ui.setup_dialog import LogoSetupDialog
+from ui.user_setup_dialog import UserSetupDialog
 from ui.transfer_actions import import_settings
 from ui.widgets import ask_cancel, ask_password, button, error, hbox, info, label, run_in_background, warn
 from version import __version__
@@ -75,10 +76,18 @@ class MainWindow(QMainWindow):
         self.current = None
         self.show_page("new")
         QTimer.singleShot(1500, lambda: self.check_updates(silent=True))
+        QTimer.singleShot(3000, lambda: stats.flush_in_background(self.settings))  # досылаем очередь
+        QTimer.singleShot(400, lambda: self._startup(import_file))
+
+    def _startup(self, import_file: str | None):
+        """Окна первого запуска по очереди: импорт настроек или мастер логотипа, затем имя сотрудника."""
         if import_file:
-            QTimer.singleShot(400, lambda: self._import_from_file(import_file))
+            self._import_from_file(import_file)
         elif not self.settings.image_path("logo") and not self.settings.get_state("logo_setup_done"):
-            QTimer.singleShot(400, self.run_setup_wizard)
+            self.run_setup_wizard()
+        if not stats.employee(self.settings):
+            UserSetupDialog(self, self.settings).exec()
+            self.pages["template"].load_values()
 
     # ------------------------------------------------------------ меню
     def _build_sidebar(self) -> QWidget:

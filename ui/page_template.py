@@ -6,19 +6,21 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QPixmap
 from PySide6.QtWidgets import (QColorDialog, QComboBox, QFileDialog, QFormLayout, QGridLayout, QLabel,
                                QLineEdit, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QTabWidget,
                                QVBoxLayout, QWidget)
 
 from core.colors import PRESETS, logo_palette, readable_accent
-from core import richtext
+from core import richtext, stats
 from core.kp_builder import auto_signature, build_kp, demo_invoice, signature_lines
 from core.settings_store import DEFAULTS, IMAGE_KINDS, Settings, hash_password
 from ui.rich_edit import RichTextEdit
+from ui.user_setup_dialog import show_instructions
 from ui.transfer_actions import export_settings, import_settings
 from ui.widgets import (Card, SwatchRow, Toggle, ask, ask_password, button, error, hbox, info, label,
-                        open_path, page_header, scroll_area)
+                        open_path, page_header, run_in_background, scroll_area)
 
 FIELDS = [
     ("company_name", "Краткое название"),
@@ -98,6 +100,7 @@ class TemplatePage(QWidget):
         self.tabs.addTab(self._tab_texts(), "Тексты")
         self.tabs.addTab(self._tab_invoice(), "Из счёта")
         self.tabs.addTab(self._tab_design(), "Оформление")
+        self.tabs.addTab(self._tab_stats(), "Статистика")
         self.tabs.addTab(self._tab_other(), "Прочее")
         root.addWidget(self.tabs, 1)
 
@@ -191,6 +194,115 @@ class TemplatePage(QWidget):
         grid.setColumnStretch(1, 1)
         return _tab(scheme, grid_w)
 
+    def _tab_stats(self):
+        g = Card("Google Таблица", "Каждое сформированное КП записывается в таблицу: лист «Сводка» с общими "
+                                   "цифрами и отдельный лист на каждого сотрудника")
+        self.toggles["stats_enabled"] = Toggle("Отправлять статистику в Google Таблицу")
+        g.body.addWidget(self.toggles["stats_enabled"])
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+        self.ed_stats_sheet = QLineEdit()
+        self.ed_stats_sheet.setPlaceholderText("https://docs.google.com/spreadsheets/d/…/edit")
+        form.addRow(label("Ссылка на таблицу", muted=True),
+                    hbox(self.ed_stats_sheet, button("Открыть таблицу", self._open_sheet)))
+        self.ed_stats_url = QLineEdit()
+        self.ed_stats_url.setPlaceholderText("https://script.google.com/macros/s/…/exec")
+        form.addRow(label("Ссылка веб-приложения", muted=True), self.ed_stats_url)
+        self.ed_stats_token = QLineEdit()
+        form.addRow(label("Секретный ключ", muted=True),
+                    hbox(self.ed_stats_token, button("Создать ключ", self._new_stats_token)))
+        g.body.addLayout(form)
+        g.body.addLayout(hbox(button("📋  Скопировать код скрипта", self._copy_stats_script),
+                              button("Проверить соединение", self._check_stats), "stretch",
+                              button("📖  Инструкция", lambda: show_instructions(self))))
+
+        me = Card("Этот компьютер", "Имя, под которым КП этого компьютера попадают в таблицу. "
+                                    "Хранится только здесь и не переносится файлом настроек")
+        self.ed_employee = QLineEdit()
+        self.ed_employee.setPlaceholderText(stats.default_employee())
+        me.body.addLayout(hbox(label("Имя сотрудника", muted=True), self.ed_employee,
+                               button("Сохранить имя", self._save_employee)))
+        self.lbl_queue = label("", muted=True, small=True)
+        me.body.addLayout(hbox(self.lbl_queue, "stretch", button("Отправить сейчас", self._flush_stats)))
+
+        how = Card("Как подключить таблицу")
+        how.body.addWidget(label(
+            "1. Создайте Google Таблицу (например «Статистика КП») и вставьте её ссылку сюда.\n"
+            "2. Здесь нажмите «Создать ключ», затем «Скопировать код скрипта».\n"
+            "3. В таблице: Расширения → Apps Script → вставьте код вместо примера → Сохранить.\n"
+            "4. Развернуть → Новое развертывание → тип «Веб-приложение», «Выполнять как: Я», "
+            "«У кого есть доступ: Все» → Развернуть → разрешите доступ.\n"
+            "5. Скопируйте ссылку веб-приложения сюда, включите переключатель и нажмите «Сохранить шаблон».\n"
+            "6. «Проверить соединение». Сотрудникам настройки придут с файлом экспорта.",
+            muted=True, small=True, wrap=True))
+        return _tab(g, me, how)
+
+    def _new_stats_token(self):
+        if self.ed_stats_token.text().strip() and not ask(
+                self, "Создать новый ключ? Старый перестанет работать — код скрипта в таблице "
+                      "нужно будет обновить."):
+            return
+        self.ed_stats_token.setText(stats.new_token())
+
+    def _copy_stats_script(self):
+        if not stats.sheet_id(self.ed_stats_sheet.text()):
+            error(self, "Сначала вставьте ссылку на Google Таблицу (из адресной строки браузера).")
+            return
+        token = self.ed_stats_token.text().strip()
+        if not token:
+            self._new_stats_token()
+            token = self.ed_stats_token.text().strip()
+        QGuiApplication.clipboard().setText(stats.apps_script_code(token, self.ed_stats_sheet.text()))
+        info(self, "Код скрипта с вашим ключом скопирован.\n\nВставьте его в таблице: "
+                   "Расширения → Apps Script. Не забудьте потом нажать «Сохранить шаблон» здесь.")
+
+    def _open_sheet(self):
+        sid = stats.sheet_id(self.ed_stats_sheet.text())
+        if not sid:
+            error(self, "Вставьте ссылку на Google Таблицу.")
+            return
+        QDesktopServices.openUrl(QUrl(f"https://docs.google.com/spreadsheets/d/{sid}/edit"))
+
+    def _check_stats(self):
+        url, token = self.ed_stats_url.text().strip(), self.ed_stats_token.text().strip()
+        if not url or not token:
+            error(self, "Укажите ссылку веб-приложения и секретный ключ.")
+            return
+        run_in_background(lambda: stats.ping(url, token), self._checked)
+
+    def _checked(self, sheet, err):
+        if err:
+            error(self, str(err))
+        else:
+            info(self, f"Соединение есть: таблица «{sheet}».")
+
+    def _save_employee(self):
+        name = self.ed_employee.text().strip()
+        if not name:
+            error(self, "Впишите имя сотрудника.")
+            return
+        self.s.set_state("employee_name", name)
+        info(self, f"Имя «{name}» сохранено для этого компьютера.")
+
+    def _update_queue_label(self):
+        n = stats.queued(self.s)
+        self.lbl_queue.setText(f"Не отправлено записей: {n}" if n else "Все записи отправлены")
+
+    def _flush_stats(self):
+        if not stats.enabled(self.s):
+            error(self, "Сначала включите статистику, укажите ссылку и ключ и сохраните шаблон.")
+            return
+        run_in_background(lambda: stats.flush(self.s), self._flushed)
+
+    def _flushed(self, res, err):
+        self._update_queue_label()
+        sent, problem = res if res else (0, str(err))
+        if problem:
+            error(self, problem)
+        else:
+            info(self, f"Отправлено записей: {sent}.")
+
     def _tab_other(self):
         main = Card()
         form = QFormLayout()
@@ -233,6 +345,11 @@ class TemplatePage(QWidget):
     def load_values(self):
         """Заполнить форму сохранёнными настройками (сбрасывает несохранённое)."""
         s = self.s
+        self.ed_stats_url.setText(s["stats_url"])
+        self.ed_stats_sheet.setText(s["stats_sheet_url"])
+        self.ed_stats_token.setText(s["stats_token"])
+        self.ed_employee.setText(stats.employee(s))
+        self._update_queue_label()
         for k, w in self.lines.items():
             w.setText(str(s[k]))
         for k, t in self.texts.items():
@@ -272,6 +389,9 @@ class TemplatePage(QWidget):
         vals["output_dir"] = self.ed_output.text().strip() or DEFAULTS["output_dir"]
         vals["accent_color"] = self.accent
         vals["editor_password_hash"] = self._new_pw_hash
+        vals["stats_url"] = self.ed_stats_url.text().strip()
+        vals["stats_sheet_url"] = self.ed_stats_sheet.text().strip()
+        vals["stats_token"] = self.ed_stats_token.text().strip()
         return vals
 
     def _image_for(self, kind):

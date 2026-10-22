@@ -46,7 +46,7 @@ class PreviewWorker(QThread):
     def run(self):
         import pythoncom
         pythoncom.CoInitialize()
-        excel = None
+        excel, excel_pid = None, None
         n = 0
         try:
             while not self._stop:
@@ -62,17 +62,30 @@ class PreviewWorker(QThread):
                 n += 1
                 try:
                     kind = office.backend(job[5])
+                    if kind == "excel" and "excel" in office._broken:
+                        kind = "other"
                     if kind is None:
                         raise office.OfficeError("Для предпросмотра нужна офисная программа: Microsoft Excel, "
                                                  "LibreOffice или Apache OpenOffice.")
                     if kind == "excel" and excel is None:
                         import win32com.client
                         excel = win32com.client.DispatchEx("Excel.Application")
+                        excel_pid = office.excel_pid(excel)
                         excel.Visible = False
                         excel.DisplayAlerts = False
                     if kind != "excel":
                         excel = self._reset_excel(excel) if excel is not None else None
-                    pages = self._render(excel if kind == "excel" else None, job, n)
+                    try:
+                        pages = self._render(excel if kind == "excel" else None, job, n)
+                    except Exception:  # noqa: BLE001
+                        if kind != "excel":
+                            raise
+                        # Excel в фоне отказал (например, не активирован) — закрываем его
+                        # и рисуем через LibreOffice/OpenOffice, если они есть
+                        office.kill_excel(excel, excel_pid)
+                        excel = None
+                        office._broken.add("excel")
+                        pages = self._render(None, job, n, skip=("excel",))
                     self.ready.emit([str(p) for p in pages])
                 except Exception as e:  # noqa: BLE001
                     excel = self._reset_excel(excel)
@@ -85,7 +98,7 @@ class PreviewWorker(QThread):
                     pass
             pythoncom.CoUninitialize()
 
-    def _render(self, excel, job, n) -> list[Path]:
+    def _render(self, excel, job, n, skip=()) -> list[Path]:
         import pypdfium2 as pdfium
         inv, meta, values, images, blocks_dir, prefer = job
         xlsx = self.dir / f"preview_{n}.xlsx"
@@ -98,7 +111,7 @@ class PreviewWorker(QThread):
             finally:
                 wb.Close(False)
         else:  # LibreOffice / OpenOffice — запуск на каждое обновление, медленнее
-            office.to_pdf(xlsx, prefer)
+            office.to_pdf(xlsx, prefer, skip)
         doc = pdfium.PdfDocument(str(pdf))
         pages = []
         try:
@@ -137,6 +150,4 @@ class PreviewWorker(QThread):
         text = str(e)
         if isinstance(e, office.OfficeError):
             return text
-        if "Invalid class string" in text or "-2147221005" in text:
-            return "Microsoft Excel не запускается. Выберите другую программу: Настройки → Шаблон КП → Прочее."
-        return f"Не удалось построить предпросмотр:\n{text}"
+        return "Не удалось построить предпросмотр: " + office.explain(e)

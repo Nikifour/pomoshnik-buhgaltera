@@ -313,3 +313,79 @@ def run_in_background(fn: Callable, on_done: Callable, on_progress: Callable | N
             bridge.done.emit(None, e)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+# ---------------------------------------------------------------- индикатор «идёт работа»
+class BusyOverlay(QWidget):
+    """Полупрозрачная заглушка поверх страницы с крутящимся индикатором и подписью.
+    Пока она показана, клики по странице не проходят — повторно нажать кнопку нельзя."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        from PySide6.QtCore import QTimer
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self._angle = 0
+        self._text = ""
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        parent.installEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, obj, event):  # noqa: N802 — повторяем размер страницы
+        from PySide6.QtCore import QEvent
+        if obj is self.parent() and event.type() in (QEvent.Resize, QEvent.Show):
+            self.setGeometry(obj.rect())
+        return False
+
+    def start(self, text: str):
+        self._text = text
+        self.setGeometry(self.parent().rect())
+        self.raise_()
+        self.show()
+        self._timer.start()
+        self.setCursor(Qt.BusyCursor)
+
+    def set_text(self, text: str):
+        self._text = text
+        self.update()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 6) % 360
+        self.update()
+
+    def mousePressEvent(self, e):  # noqa: N802 — клики «съедаем»
+        e.accept()
+
+    def paintEvent(self, _):  # noqa: N802
+        from PySide6.QtGui import QPen
+        c = T.colors()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        bg = QColor(c["bg"])
+        bg.setAlpha(190)
+        p.fillRect(self.rect(), bg)
+        # карточка в центре
+        w, h = 300, 150
+        card = QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
+        p.setPen(QColor(c["border"]))
+        p.setBrush(QColor(c["card"]))
+        p.drawRoundedRect(card, 14, 14)
+        # кольцо-индикатор
+        r = 22
+        ring = QRectF(card.center().x() - r, card.top() + 26, 2 * r, 2 * r)
+        pen = QPen(QColor(c["border"]), 5)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(ring)
+        pen.setColor(QColor(c["brand"]))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(ring, -self._angle * 16, 100 * 16)
+        p.setPen(QColor(c["text"]))
+        p.drawText(QRectF(card.left() + 10, ring.bottom() + 14, w - 20, 40), Qt.AlignHCenter | Qt.AlignTop, self._text)
+        p.end()

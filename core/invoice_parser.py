@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import re
-import tempfile
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -116,34 +115,22 @@ def split_buyer(text: str) -> tuple[str, str]:
     return name, details
 
 
-def _convert_xls(path: Path) -> Path:
-    """Старый .xls через установленный Excel пересохраняем в .xlsx."""
-    try:
-        import win32com.client  # noqa: WPS433
-    except ImportError as e:
-        raise InvoiceError("Для файлов .xls нужен установленный Microsoft Excel.") from e
-    out = Path(tempfile.mkdtemp()) / (path.stem + ".xlsx")
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
-    try:
-        wb = excel.Workbooks.Open(str(path.resolve()), ReadOnly=True)
-        wb.SaveAs(str(out), FileFormat=51)
-        wb.Close(False)
-    finally:
-        excel.Quit()
-    return out
-
-
 # ---------------------------------------------------------------- разбор листа
 class _Grid:
-    def __init__(self, ws):
-        self.cells: dict[tuple[int, int], object] = {}
-        for row in ws.iter_rows():
-            for c in row:
-                if c.value is not None and _norm(c.value) != "":
-                    self.cells[(c.row, c.column)] = c.value
+    """Непустые ячейки листа: {(строка, колонка): значение}, нумерация с 1 — как в Excel."""
+
+    def __init__(self, cells: dict[tuple[int, int], object]):
+        self.cells = {k: v for k, v in cells.items() if v is not None and _norm(v) != ""}
         self.max_row = max((r for r, _ in self.cells), default=0)
+
+    @classmethod
+    def from_openpyxl(cls, ws) -> "_Grid":
+        return cls({(c.row, c.column): c.value for row in ws.iter_rows() for c in row})
+
+    @classmethod
+    def from_xlrd(cls, sh) -> "_Grid":
+        """Старый формат .xls читаем сами (xlrd) — ни Excel, ни другой офис не нужен."""
+        return cls({(r + 1, c + 1): sh.cell_value(r, c) for r in range(sh.nrows) for c in range(sh.ncols)})
 
     def row(self, r: int) -> list[tuple[int, object]]:
         return sorted((c, v) for (rr, c), v in self.cells.items() if rr == r)
@@ -191,8 +178,7 @@ def _find_header(g: _Grid) -> tuple[int, dict[str, int]] | None:
     return (best[0], best[1]) if best else None
 
 
-def _parse_sheet(ws, source: str) -> Invoice | None:
-    g = _Grid(ws)
+def _parse_sheet(g: _Grid, source: str) -> Invoice | None:
     found = _find_header(g)
     if not found:
         return None
@@ -276,14 +262,18 @@ def _parse_sheet(ws, source: str) -> Invoice | None:
 
 def parse_invoice(path: str | Path) -> Invoice:
     path = Path(path)
-    if path.suffix.lower() == ".xls":
-        path = _convert_xls(path)
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        if path.suffix.lower() == ".xls":
+            import xlrd
+            book = xlrd.open_workbook(str(path))
+            grids = [_Grid.from_xlrd(sh) for sh in book.sheets()]
+        else:
+            wb = openpyxl.load_workbook(path, data_only=True)
+            grids = [_Grid.from_openpyxl(ws) for ws in wb.worksheets]
     except Exception as e:
         raise InvoiceError(f"Не удалось открыть файл:\n{e}") from e
-    for ws in wb.worksheets:
-        inv = _parse_sheet(ws, str(path))
+    for g in grids:
+        inv = _parse_sheet(g, str(path))
         if inv:
             return inv
     raise InvoiceError("В файле не найдена таблица товаров.\n"

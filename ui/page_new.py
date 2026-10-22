@@ -10,9 +10,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QDateEdit, QDialog, QFileDialo
 
 from core import stats
 from core.invoice_parser import Invoice, InvoiceError, parse_invoice
-from core.kp_builder import KPMeta, build_kp, export_pdf, safe_filename
+from core.kp_builder import KPMeta, build_kp, safe_filename
+from core.office import to_pdf
 from core.settings_store import Settings
-from ui.widgets import (Card, Toggle, button, error, hbox, label, open_path, page_header, repolish,
+from ui.widgets import (BusyOverlay, Card, Toggle, button, error, hbox, label, open_path, page_header, repolish,
                         run_in_background, warn, ask)
 
 INVOICE_EXT = (".xlsx", ".xlsm", ".xls")
@@ -154,6 +155,7 @@ class NewKPPage(QWidget):
         bar = hbox("stretch", self.btn_make)
         bar.insertLayout(0, totals)
         root.addLayout(bar)
+        self.busy = BusyOverlay(self)
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -164,14 +166,21 @@ class NewKPPage(QWidget):
             self.load_invoice(path)
 
     def load_invoice(self, path: str):
-        try:
-            inv = parse_invoice(path)
-        except InvoiceError as e:
-            error(self, str(e))
+        """Счёт читается в фоне — окно не «замирает», поверх страницы крутится индикатор."""
+        self.busy.start("Читаю счёт…")
+        run_in_background(lambda: parse_invoice(path), lambda inv, err: self._invoice_loaded(path, inv, err))
+
+    def _invoice_loaded(self, path: str, inv, err):
+        self.busy.stop()
+        if isinstance(err, InvoiceError):
+            error(self, str(err))
             return
-        except Exception as e:  # noqa: BLE001
-            error(self, f"Не удалось прочитать счёт:\n{e}")
+        if err:
+            error(self, f"Не удалось прочитать счёт:\n{err}")
             return
+        self.apply_invoice(inv, path)
+
+    def apply_invoice(self, inv: Invoice, path: str):
         self.invoice = inv
         self.drop.title.setText(f"Счёт на оплату № {inv.number}" + (f" от {inv.date:%d.%m.%Y}" if inv.date else ""))
         self.drop.sub.setText(Path(path).name)
@@ -224,30 +233,40 @@ class NewKPPage(QWidget):
         out = Path(self.s["output_dir"]) / f"{safe_filename(name)}.xlsx"
         if out.exists() and not ask(self, f"Файл уже существует:\n{out.name}\n\nЗаменить?"):
             return
-        try:
-            build_kp(self.invoice, meta, self.s.values, self.s.images(), out, self.s.blocks_dir)
-        except PermissionError:
+        want_pdf = self.tg_pdf.isChecked()
+        inv, values, images, blocks = self.invoice, dict(self.s.values), self.s.images(), self.s.blocks_dir
+        prefer = self.s.get_state("office_program", "auto")  # программа для PDF — настройка этого компьютера
+
+        def work(progress):
+            build_kp(inv, meta, values, images, out, blocks)
+            if not want_pdf:
+                return None, None
+            progress(0.5)  # КП в Excel готово — дальше PDF
+            try:
+                return to_pdf(out, prefer), None
+            except Exception as e:  # noqa: BLE001
+                return None, e
+
+        self.busy.start("Создаю КП…")
+        run_in_background(work, lambda res, err: self._built(out, number, res, err),
+                          on_progress=lambda _: self.busy.set_text("Сохраняю PDF…"))
+
+    def _built(self, out: Path, number: str, res, err):
+        self.busy.stop()
+        if isinstance(err, PermissionError):
             error(self, f"Не удалось записать файл — возможно, он открыт в Excel:\n{out}")
             return
-        except Exception as e:  # noqa: BLE001
-            error(self, f"Ошибка при создании КП:\n{e}")
+        if err:
+            error(self, f"Ошибка при создании КП:\n{err}")
             return
         if number == str(self.s.next_number()):
             self.s.commit_number(int(number))  # номер был из счётчика — сдвигаем счётчик
-
-        if self.tg_pdf.isChecked():
-            self.btn_make.setEnabled(False)
-            self.btn_make.setText("Сохраняю PDF…")
-            run_in_background(lambda: export_pdf(out), lambda pdf, err: self._done(out, pdf, err))
-        else:
-            self._done(out, None, None)
+        pdf, pdf_err = res
+        self._done(out, pdf, pdf_err)
 
     def _done(self, xlsx: Path, pdf: Path | None, err: Exception | None):
-        self.btn_make.setEnabled(True)
-        self.btn_make.setText("Сформировать КП  →")
         if err:
-            warn(self, "КП в Excel создано, но PDF сохранить не удалось "
-                       f"(нужен установленный Microsoft Excel):\n{err}")
+            warn(self, f"КП в Excel создано, но PDF сохранить не удалось:\n{err}")
         if self.on_created:
             self.on_created()
         self._send_stats()

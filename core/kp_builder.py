@@ -602,23 +602,10 @@ def _apply_legal_tenge(ws):
             hf.text = legal_tenge(hf.text)
 
 
-def export_pdf(xlsx: Path) -> Path:
-    """PDF через установленный Excel. Бросает исключение, если Excel недоступен."""
-    import pythoncom
-    import win32com.client
-    pdf = xlsx.with_suffix(".pdf")
-    pythoncom.CoInitialize()
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
-    try:
-        wb = excel.Workbooks.Open(str(xlsx.resolve()), ReadOnly=True)
-        wb.ExportAsFixedFormat(0, str(pdf.resolve()))
-        wb.Close(False)
-    finally:
-        excel.Quit()
-        pythoncom.CoUninitialize()
-    return pdf
+def export_pdf(xlsx: Path, prefer: str = "auto") -> Path:
+    """PDF из КП — через Excel, LibreOffice или Apache OpenOffice (core/office.py)."""
+    from core.office import to_pdf
+    return to_pdf(xlsx, prefer)
 
 
 def demo_invoice(settings: dict | None = None) -> tuple[Invoice, KPMeta]:

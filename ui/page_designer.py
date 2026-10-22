@@ -308,7 +308,8 @@ class DesignerPage(QWidget):
             self.worker.started_job.connect(lambda: self.status.setText("обновляю…"))
         inv, meta = demo_invoice(self.s.values)
         values = {**self.s.values, "layout": self.layout_data}
-        self.worker.request(inv, meta, values, self.s.images(), self.s.blocks_dir)
+        self.worker.request(inv, meta, values, self.s.images(), self.s.blocks_dir,
+                            self.s.get_state("office_program", "auto"))
 
     def _show_pages(self, paths: list):
         self.status.setText("")

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from core import office
 from core.kp_builder import build_kp
 
 
@@ -30,9 +31,9 @@ class PreviewWorker(QThread):
         self.dir = Path(tempfile.mkdtemp(prefix="pb_preview_"))
         self.xlsx_path: Path | None = None  # последний собранный файл — для «Открыть в Excel»
 
-    def request(self, inv, meta, values: dict, images: dict, blocks_dir: Path):
+    def request(self, inv, meta, values: dict, images: dict, blocks_dir: Path, prefer: str = "auto"):
         with self._lock:
-            self._job = (inv, meta, dict(values), dict(images), blocks_dir)
+            self._job = (inv, meta, dict(values), dict(images), blocks_dir, prefer)
         self._wake.set()
         if not self.isRunning():
             self.start()
@@ -60,12 +61,18 @@ class PreviewWorker(QThread):
                 self.started_job.emit()
                 n += 1
                 try:
-                    if excel is None:
+                    kind = office.backend(job[5])
+                    if kind is None:
+                        raise office.OfficeError("Для предпросмотра нужна офисная программа: Microsoft Excel, "
+                                                 "LibreOffice или Apache OpenOffice.")
+                    if kind == "excel" and excel is None:
                         import win32com.client
                         excel = win32com.client.DispatchEx("Excel.Application")
                         excel.Visible = False
                         excel.DisplayAlerts = False
-                    pages = self._render(excel, job, n)
+                    if kind != "excel":
+                        excel = self._reset_excel(excel) if excel is not None else None
+                    pages = self._render(excel if kind == "excel" else None, job, n)
                     self.ready.emit([str(p) for p in pages])
                 except Exception as e:  # noqa: BLE001
                     excel = self._reset_excel(excel)
@@ -80,15 +87,18 @@ class PreviewWorker(QThread):
 
     def _render(self, excel, job, n) -> list[Path]:
         import pypdfium2 as pdfium
-        inv, meta, values, images, blocks_dir = job
+        inv, meta, values, images, blocks_dir, prefer = job
         xlsx = self.dir / f"preview_{n}.xlsx"
         pdf = xlsx.with_suffix(".pdf")
         build_kp(inv, meta, values, images, xlsx, blocks_dir)
-        wb = excel.Workbooks.Open(str(xlsx), ReadOnly=True)
-        try:
-            wb.ExportAsFixedFormat(0, str(pdf))
-        finally:
-            wb.Close(False)
+        if excel is not None:  # Excel уже открыт в фоне — быстро
+            wb = excel.Workbooks.Open(str(xlsx), ReadOnly=True)
+            try:
+                wb.ExportAsFixedFormat(0, str(pdf))
+            finally:
+                wb.Close(False)
+        else:  # LibreOffice / OpenOffice — запуск на каждое обновление, медленнее
+            office.to_pdf(xlsx, prefer)
         doc = pdfium.PdfDocument(str(pdf))
         pages = []
         try:
@@ -125,6 +135,8 @@ class PreviewWorker(QThread):
     @staticmethod
     def _explain(e: Exception) -> str:
         text = str(e)
+        if isinstance(e, office.OfficeError):
+            return text
         if "Invalid class string" in text or "-2147221005" in text:
-            return "Для предпросмотра нужен установленный Microsoft Excel."
+            return "Microsoft Excel не запускается. Выберите другую программу: Настройки → Шаблон КП → Прочее."
         return f"Не удалось построить предпросмотр:\n{text}"

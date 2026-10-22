@@ -13,14 +13,14 @@ from PySide6.QtWidgets import (QColorDialog, QComboBox, QFileDialog, QFormLayout
                                QVBoxLayout, QWidget)
 
 from core.colors import PRESETS, logo_palette, readable_accent
-from core import richtext, stats
+from core import office, richtext, stats
 from core.kp_builder import auto_signature, build_kp, demo_invoice, signature_lines
 from core.settings_store import DEFAULTS, IMAGE_KINDS, Settings, hash_password
 from ui.rich_edit import RichTextEdit
 from ui.user_setup_dialog import show_instructions
 from ui.transfer_actions import export_settings, import_settings
 from ui.widgets import (Card, SwatchRow, Toggle, ask, ask_password, button, error, hbox, info, label,
-                        open_path, page_header, run_in_background, scroll_area)
+                        open_path, page_header, run_in_background, scroll_area, warn)
 
 FIELDS = [
     ("company_name", "Краткое название"),
@@ -329,6 +329,16 @@ class TemplatePage(QWidget):
         sec.body.addLayout(hbox(self.pw_label, "stretch", button("Задать пароль…", self.set_password),
                                 button("Снять пароль", self.clear_password)))
 
+        prog = Card("Программа для PDF и предпросмотра",
+                    "Настройка этого компьютера — файлом настроек не переносится. "
+                    "Применяется сразу, без «Сохранить шаблон»")
+        self.cb_office = QComboBox()
+        self.cb_office.setMinimumWidth(320)
+        self.cb_office.currentIndexChanged.connect(self._office_changed)
+        self.lbl_office = label("", muted=True, small=True, wrap=True)
+        prog.body.addLayout(hbox(self.cb_office, "stretch"))
+        prog.body.addWidget(self.lbl_office)
+
         bk = Card("Резервные копии", "Создаются автоматически при каждом сохранении (последние 10)")
         self.backup_combo = QComboBox()
         self.backup_combo.setMinimumWidth(240)
@@ -339,7 +349,7 @@ class TemplatePage(QWidget):
         self.lbl_dir.setTextInteractionFlags(Qt.TextSelectableByMouse)
         # длинный путь без пробелов не должен растягивать страницу вправо
         self.lbl_dir.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        return _tab(main, transfer, sec, bk, self.lbl_dir)
+        return _tab(main, prog, transfer, sec, bk, self.lbl_dir)
 
     # ------------------------------------------------------------ данные
     def load_values(self):
@@ -371,6 +381,7 @@ class TemplatePage(QWidget):
         self.set_color(s["accent_color"])
         self._fill_backups()
         self.lbl_dir.setText(f"Настройки хранятся в: {s.dir}")
+        self._fill_office()
 
     def collect(self) -> dict:
         vals = {k: w.text().strip() for k, w in self.lines.items()}
@@ -455,6 +466,36 @@ class TemplatePage(QWidget):
         d = QFileDialog.getExistingDirectory(self, "Папка для готовых КП", self.ed_output.text())
         if d:
             self.ed_output.setText(d)
+
+    def _fill_office(self):
+        have = office.installed()
+        self.cb_office.blockSignals(True)
+        self.cb_office.clear()
+        auto = office.NAMES.get(have[0], "не найдена") if have else "не найдена"
+        self.cb_office.addItem(f"Автоматически (сейчас: {auto})", "auto")
+        for code in office.ORDER:
+            mark = "" if code in have else "  — не установлена"
+            self.cb_office.addItem(office.NAMES[code] + mark, code)
+        current = self.s.get_state("office_program", "auto")
+        self.cb_office.setCurrentIndex(max(0, self.cb_office.findData(current)))
+        self.cb_office.blockSignals(False)
+        self._office_hint()
+
+    def _office_changed(self, _):
+        code = self.cb_office.currentData()
+        if code and code != "auto" and code not in office.installed():
+            warn(self, f"{office.NAMES[code]} не найдена на этом компьютере — пока будет использоваться "
+                       f"{office.backend_name(code)}.")
+        self.s.set_state("office_program", code or "auto")
+        self._office_hint()
+
+    def _office_hint(self):
+        have = office.installed()
+        found = ", ".join(office.NAMES[k] for k in have) or "ничего"
+        used = office.backend_name(self.s.get_state("office_program", "auto"))
+        tip = ("" if have else " Без офисной программы КП сохраняется только в Excel-формате (.xlsx), "
+                               "без PDF и без предпросмотра в конструкторе.")
+        self.lbl_office.setText(f"Установлено: {found}. Сейчас используется: {used}.{tip}")
 
     def _update_pw_label(self):
         self.pw_label.setText("🔒  Пароль на шаблон установлен" if self._new_pw_hash

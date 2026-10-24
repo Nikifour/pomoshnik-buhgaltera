@@ -206,9 +206,10 @@ def _libreoffice_pdf(soffice: Path, xlsx: Path, pdf: Path) -> Path:
 
 
 # Скрипт для Python, встроенного в Apache OpenOffice (там Python 2.7 — пишем совместимо).
-_UNO_SCRIPT = r'''
+# Только латиница: Python 2.7 без объявления кодировки не читает файл с русскими буквами.
+_UNO_SCRIPT = r'''# -*- coding: utf-8 -*-
 import os, sys, time, subprocess
-# модуль uno лежит в папке program самого OpenOffice — добавляем её в пути поиска
+# uno module lives in the OpenOffice "program" folder - add it to the import path
 sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])))
 import uno
 from com.sun.star.beans import PropertyValue
